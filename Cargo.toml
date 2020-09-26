@@ -1,0 +1,8 @@
+[workspace]
+
+members = [
+    "fakt-core",
+    "fakt",
+    "fakt-client",
+    "fakt-server",
+]
