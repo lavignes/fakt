@@ -1,0 +1,105 @@
+use crate::compiler::ast;
+
+grammar;
+
+match {
+    r"\s*" => { },
+    r"#[^\n\r]*[\n\r]*" => { },
+    r"pkg" => "package keyword",
+    r"never" => "never keyword",
+    r"and" => "and",
+    r"or" => "or",
+    r"xor" => "xor",
+    r"not" => "not",
+} else {
+    r"[_\p{L}][_\p{L}\p{Mn}\p{Mc}\p{Nd}\p{Pc}\u200C\u200D]*" => identifier,
+} else {
+    r#""[^"]*""# => "quoted string",
+    r#"[\.\w]+"# => "unquoted string",
+    _
+}
+
+pub Package: ast::Package = {
+    "package keyword" <name:Name> ";" <rules:Rules> => ast::Package {
+        name,
+        rules,
+    },
+}
+
+Name: String = {
+    <name:Name> "." <ident:identifier> => {
+        let mut name = name;
+        name.push_str(ident);
+        name
+    },
+    identifier => String::from(<>),
+}
+
+Rules: Vec<ast::Rule> = {
+    <rules:(<Rule> ",")*> <rule:Rule?> => match rule {
+        None => rules,
+        Some(rule) => {
+            let mut rules = rules;
+            rules.push(rule);
+            rules
+        }
+    },
+}
+
+Rule: ast::Rule = {
+    <condition:Condition> "{" <children:Rules> "}" => ast::Rule {
+        description: None,
+        condition,
+        properties: None,
+        children: Some(children),
+    },
+    "never keyword" "{" Rules "}" => ast::Rule {
+        description: None,
+        condition: ast::Condition::Never,
+        properties: None,
+        children: None,
+    },
+}
+
+Condition: ast::Condition = {
+    <lhs:Condition> "or" <rhs:ConditionHighPrecedence> => ast::Condition::Or(Box::new(lhs), Box::new(rhs)),
+    ConditionHighPrecedence => <>,
+}
+
+ConditionHighPrecedence: ast::Condition = {
+    <lhs:ConditionHighPrecedence> "xor" <rhs:ConditionHigherPrecedence> => ast::Condition::Xor(Box::new(lhs), Box::new(rhs)),
+    ConditionHigherPrecedence => <>,
+}
+
+ConditionHigherPrecedence: ast::Condition = {
+    <lhs:ConditionHigherPrecedence> "and" <rhs:ConditionHighestPrecedence> => ast::Condition::And(Box::new(lhs), Box::new(rhs)),
+    ConditionHighestPrecedence => <>,
+}
+
+ConditionHighestPrecedence: ast::Condition = {
+    "(" <condition:Condition> ")" => condition,
+    "not" <condition:ConditionHighestPrecedence> => ast::Condition::Not(Box::new(condition)),
+    FactCondition => <>,
+}
+
+FactCondition: ast::Condition = {
+    <name:Name> "(" <args:FactConditionArgs> ")" => ast::Condition::Fact(name, Some(args)),
+    <name:Name> => ast::Condition::Fact(name, None),
+}
+
+FactConditionArgs: Vec<String> = {
+    <args:(<StringValue> ",")*> <arg:StringValue?> => match arg {
+        None => args,
+        Some(arg) => {
+            let mut args = args;
+            args.push(String::from(arg));
+            args
+        }
+    },
+}
+
+StringValue: String = {
+    "quoted string" => String::from(&(<>)[1..(<>).len()-1]),
+    "unquoted string" => String::from(<>),
+    identifier => String::from(<>),
+}
