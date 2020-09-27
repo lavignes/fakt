@@ -161,7 +161,7 @@ impl Parser {
         let mut property = AstProperty::default();
         let mut rules = Vec::new();
 
-        let chars = reader.chars();
+        let chars = reader.char_stream();
         'next_char: for result in chars {
             self.column += 1;
             let c = result.map_err(|err| {

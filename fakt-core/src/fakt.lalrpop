@@ -63,6 +63,7 @@ Rule: ast::Rule = {
 
 Condition: ast::Condition = {
     <lhs:Condition> "or" <rhs:ConditionHighPrecedence> => ast::Condition::Or(Box::new(lhs), Box::new(rhs)),
+    <lhs:Condition> "," <rhs:ConditionHighPrecedence> => ast::Condition::Or(Box::new(lhs), Box::new(rhs)),
     ConditionHighPrecedence => <>,
 }
 
@@ -72,18 +73,19 @@ ConditionHighPrecedence: ast::Condition = {
 }
 
 ConditionHigherPrecedence: ast::Condition = {
-    <lhs:ConditionHigherPrecedence> "and" <rhs:ConditionHighestPrecedence> => ast::Condition::And(Box::new(lhs), Box::new(rhs)),
+    <lhs:ConditionHigherPrecedence> "and"? <rhs:ConditionHighestPrecedence> => ast::Condition::And(Box::new(lhs), Box::new(rhs)),
     ConditionHighestPrecedence => <>,
 }
 
 ConditionHighestPrecedence: ast::Condition = {
     "(" <condition:Condition> ")" => condition,
     "not" <condition:ConditionHighestPrecedence> => ast::Condition::Not(Box::new(condition)),
+    "!" <condition:ConditionHighestPrecedence> => ast::Condition::Not(Box::new(condition)),
     FactCondition => <>,
 }
 
 FactCondition: ast::Condition = {
-    <name:Name> "(" <args:FactConditionArgs> ")" => ast::Condition::Fact(name, Some(args)),
+    <name:Name> "[" <args:FactConditionArgs> "]" => ast::Condition::Fact(name, Some(args)),
     <name:Name> => ast::Condition::Fact(name, None),
 }
 

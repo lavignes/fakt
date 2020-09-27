@@ -104,14 +104,16 @@ mod tests {
         let mut p = Parser::new();
         assert_parse_err(p.parse(r##"
             pkg hello;
+            # 2 is obviously not valid
             2
-        "##), "Unrecognized token `2` found at 36:37\nExpected one of \"(\", \"never\", \"not\" or identifier");
+        "##), "Unrecognized token `2` found at 75:76\nExpected one of \"!\", \"(\", \"never\", \"not\" or identifier");
 
         let mut p = Parser::new();
         assert_parse_err(p.parse(r##"
             pkg hello;
+            # neither is 2 here
             foo.2 {}
-        "##), "Unrecognized token `foo.2` found at 36:41\nExpected one of \"(\", \"never\", \"not\" or identifier");
+        "##), "Unrecognized token `foo.2` found at 68:73\nExpected one of \"!\", \"(\", \"never\", \"not\" or identifier");
     }
 
     #[test]
@@ -131,7 +133,8 @@ mod tests {
         let p = r##"
             pkg hello;
             
-            test(arg) {}
+            # args are passed using [ ]
+            test[arg] {}
         "##;
         let p = Parser::new().parse(p).unwrap();
         assert_eq!("hello", p.name);
@@ -144,7 +147,8 @@ mod tests {
         let p = r##"
             pkg hello;
             
-            test("quoted") {}
+            # and args are actually always strings
+            test["quoted"] {}
         "##;
         let p = Parser::new().parse(p).unwrap();
         assert_eq!("hello", p.name);
@@ -157,7 +161,8 @@ mod tests {
         let p = r##"
             pkg hello;
             
-            test(1234) {}
+            # even if they look like numbers
+            test[1234] {}
         "##;
         let p = Parser::new().parse(p).unwrap();
         assert_eq!("hello", p.name);
@@ -170,7 +175,8 @@ mod tests {
         let p = r##"
             pkg hello;
             
-            test(hello, "strings! ", 12345) {}
+            # even if they look like numbers
+            test[hello, "strings! ", 12345] {}
         "##;
         let p = Parser::new().parse(p).unwrap();
         assert_eq!("hello", p.name);
@@ -188,7 +194,22 @@ mod tests {
         let p = r##"
             pkg hello;
             
+            # you can explicily union two facts
             test1 and test2 {}
+        "##;
+        let p = Parser::new().parse(p).unwrap();
+        assert_eq!("hello", p.name);
+        assert!(matches!(&p.rules[0].condition, Condition::And(_, _)));
+        if let Condition::And(lhs, rhs) = &p.rules[0].condition {
+            assert!(matches!(&**lhs, Condition::Fact(name, None) if name == "test1"));
+            assert!(matches!(&**rhs, Condition::Fact(name, None) if name == "test2"));
+        }
+
+        let p = r##"
+            pkg hello;
+            
+            # but its also implicit
+            test1 test2 {}
         "##;
         let p = Parser::new().parse(p).unwrap();
         assert_eq!("hello", p.name);
@@ -204,7 +225,22 @@ mod tests {
         let p = r##"
             pkg hello;
             
+            # same for or
             test1 or test2 {}
+        "##;
+        let p = Parser::new().parse(p).unwrap();
+        assert_eq!("hello", p.name);
+        assert!(matches!(&p.rules[0].condition, Condition::Or(_, _)));
+        if let Condition::Or(lhs, rhs) = &p.rules[0].condition {
+            assert!(matches!(&**lhs, Condition::Fact(name, None) if name == "test1"));
+            assert!(matches!(&**rhs, Condition::Fact(name, None) if name == "test2"));
+        }
+
+        let p = r##"
+            pkg hello;
+            
+            # except you use commas
+            test1, test2 {}
         "##;
         let p = Parser::new().parse(p).unwrap();
         assert_eq!("hello", p.name);
@@ -220,6 +256,7 @@ mod tests {
         let p = r##"
             pkg hello;
             
+            # xor can be useful sometimes
             test1 xor test2 {}
         "##;
         let p = Parser::new().parse(p).unwrap();
@@ -236,7 +273,21 @@ mod tests {
         let p = r##"
             pkg hello;
             
+            # as with not
             not funny {}
+        "##;
+        let p = Parser::new().parse(p).unwrap();
+        assert_eq!("hello", p.name);
+        assert!(matches!(&p.rules[0].condition, Condition::Not(_)));
+        if let Condition::Not(cond) = &p.rules[0].condition {
+            assert!(matches!(&**cond, Condition::Fact(name, None) if name == "funny"));
+        }
+
+        let p = r##"
+            pkg hello;
+            
+            # especially with the short syntax
+            !funny {}
         "##;
         let p = Parser::new().parse(p).unwrap();
         assert_eq!("hello", p.name);
@@ -251,6 +302,7 @@ mod tests {
         let p = r##"
             pkg hello;
             
+            # never is just always false
             never {}
         "##;
         let p = Parser::new().parse(p).unwrap();
@@ -263,6 +315,7 @@ mod tests {
         let p = r##"
             pkg hello;
             
+            # ands can also be expressed via nesting
             test { inner and more {} }
         "##;
         let p = Parser::new().parse(p).unwrap();
