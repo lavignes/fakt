@@ -69,7 +69,7 @@ mod tests {
         let mut p = Parser::new();
         assert_parse_err(
             p.parse(""),
-            "Unrecognized EOF found at 0\nExpected one of \"package keyword\"",
+            "Unrecognized EOF found at 0\nExpected one of \"pkg\"",
         );
     }
 
@@ -105,13 +105,13 @@ mod tests {
         assert_parse_err(p.parse(r##"
             pkg hello;
             2
-        "##), "Unrecognized token `2` found at 36:37\nExpected one of \"(\", \"never keyword\", \"not\" or identifier");
+        "##), "Unrecognized token `2` found at 36:37\nExpected one of \"(\", \"never\", \"not\" or identifier");
 
         let mut p = Parser::new();
         assert_parse_err(p.parse(r##"
             pkg hello;
             foo.2 {}
-        "##), "Unrecognized token `foo.2` found at 36:41\nExpected one of \"(\", \"never keyword\", \"not\" or identifier");
+        "##), "Unrecognized token `foo.2` found at 36:41\nExpected one of \"(\", \"never\", \"not\" or identifier");
     }
 
     #[test]
