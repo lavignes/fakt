@@ -58,6 +58,7 @@ pub trait CharStreamExt<R: AsyncRead> {
 }
 
 impl<R: AsyncRead> CharStreamExt<R> for R {
+    #[inline]
     fn char_stream(self) -> CharStream<R> {
         CharStream {
             buf: [0, 0, 0, 0],
@@ -79,40 +80,38 @@ impl<'a, R: AsyncRead + Unpin> Stream for CharStream<R> {
             (&mut s.buf, &mut s.len, Pin::new(&mut s.reader))
         };
         match reader.as_mut().poll_read(cx, &mut buf[*len..*len + 1]) {
-            Poll::Ready(result) => match result {
-                Ok(l) => {
-                    // End of input
-                    if l == 0 {
-                        if *len == 0 {
-                            Poll::Ready(None)
-                        } else {
-                            Poll::Ready(Some(Err(str::from_utf8(&buf[0..*len])
-                                .map_err(Error::from)
-                                .err()
-                                .unwrap())))
-                        }
-                    } else if (*len + 1) == 4 {
-                        *len = 0;
-                        Poll::Ready(Some(
-                            str::from_utf8(&buf[0..(*len + 1)])
-                                .map_err(Error::from)
-                                .map(|s| s.chars().next().unwrap()),
-                        ))
+            Poll::Ready(Ok(l)) => {
+                // End of input
+                if l == 0 {
+                    if *len == 0 {
+                        Poll::Ready(None)
                     } else {
-                        *len = *len + 1;
-                        // read as many as possible.
-                        if let Ok(c) = str::from_utf8(&buf[0..*len]) {
-                            *len = 0;
-                            Poll::Ready(Some(Ok(c.chars().next().unwrap())))
-                        } else {
-                            Poll::Pending
-                        }
+                        Poll::Ready(Some(Err(str::from_utf8(&buf[0..*len])
+                            .map_err(Error::from)
+                            .err()
+                            .unwrap())))
+                    }
+                } else if (*len + 1) == 4 {
+                    *len = 0;
+                    Poll::Ready(Some(
+                        str::from_utf8(&buf[0..(*len + 1)])
+                            .map_err(Error::from)
+                            .map(|s| s.chars().next().unwrap()),
+                    ))
+                } else {
+                    *len = *len + 1;
+                    // read as many as possible.
+                    if let Ok(c) = str::from_utf8(&buf[0..*len]) {
+                        *len = 0;
+                        Poll::Ready(Some(Ok(c.chars().next().unwrap())))
+                    } else {
+                        Poll::Pending
                     }
                 }
-                Err(err) => match err.kind() {
-                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted => Poll::Pending,
-                    _ => Poll::Ready(Some(Err(err.into()))),
-                },
+            }
+            Poll::Ready(Err(err)) => match err.kind() {
+                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted => Poll::Pending,
+                _ => Poll::Ready(Some(Err(err.into()))),
             },
             Poll::Pending => Poll::Pending,
         }
