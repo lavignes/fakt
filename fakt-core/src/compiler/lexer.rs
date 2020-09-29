@@ -1,5 +1,5 @@
 use crate::{
-    collections::{Interned, Interner, InternerRcExt},
+    collections::{Interned, Interner, InternerRcWriteExt},
     util::charstream::{self, CharStream, CharStreamExt},
 };
 use futures::{

@@ -1,8 +1,8 @@
 use crate::collections::XorHashMap;
-use std::ptr::slice_from_raw_parts;
-use std::rc::Rc;
-use std::sync::Arc;
-use std::{hash::Hash, marker::PhantomData, str};
+use std::{
+    hash::Hash, marker::PhantomData, ops::DerefMut, ptr::slice_from_raw_parts, rc::Rc, str,
+    sync::Arc, sync::RwLock,
+};
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct Interned<T: ?Sized> {
@@ -90,14 +90,14 @@ where
     }
 }
 
-pub trait InternerRcExt<T>
+pub trait InternerRcWriteExt<T>
 where
     T: Internable + Eq + Hash + ?Sized + 'static,
 {
     fn intern(&mut self, value: &T) -> Option<Interned<T>>;
 }
 
-impl<T> InternerRcExt<T> for Rc<Interner<T>>
+impl<T> InternerRcWriteExt<T> for Rc<Interner<T>>
 where
     T: Internable + Eq + Hash + ?Sized + 'static,
 {
@@ -106,12 +106,12 @@ where
     }
 }
 
-impl<T> InternerRcExt<T> for Arc<Interner<T>>
+impl<T> InternerRcWriteExt<T> for Arc<RwLock<Interner<T>>>
 where
     T: Internable + Eq + Hash + ?Sized + 'static,
 {
     fn intern(&mut self, value: &T) -> Option<Interned<T>> {
-        Arc::get_mut(self).map(|s| s.intern(value))
+        Arc::get_mut(self).map(|s| s.write().unwrap().deref_mut().intern(value))
     }
 }
 
