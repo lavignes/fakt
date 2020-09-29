@@ -2,8 +2,6 @@ use std::collections::HashMap;
 
 #[derive(Debug)]
 pub enum Condition {
-    /// special condition that is always false
-    Never,
     Fact(String, Option<Vec<String>>),
     And(Box<Condition>, Box<Condition>),
     Or(Box<Condition>, Box<Condition>),
@@ -27,8 +25,6 @@ pub struct Property {
 
 #[derive(Debug)]
 pub struct Rule {
-    /// Optional rule description that can be sent used for debugging when rules match
-    pub(crate) description: Option<String>,
     pub(crate) condition: Condition,
     pub(crate) properties: Option<Vec<Property>>,
     pub(crate) children: Option<Vec<Rule>>,

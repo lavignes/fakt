@@ -1,21 +1,25 @@
-use crate::util::charstream::{self, CharStream, CharStreamExt};
+use crate::{
+    collections::{Interned, Interner, InternerRcExt},
+    util::charstream::{self, CharStream, CharStreamExt},
+};
 use futures::{
     io::ErrorKind,
     task::{Context, Poll},
     AsyncRead, Stream,
 };
 use std::{
-    error, fmt,
-    fmt::{Display, Formatter},
+    error,
+    fmt::{self, Display, Formatter},
     io,
     pin::Pin,
+    rc::Rc,
     str,
 };
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub struct Location {
-    line: usize,
-    column: usize,
+    pub(crate) line: usize,
+    pub(crate) column: usize,
 }
 
 #[derive(Debug)]
@@ -43,7 +47,6 @@ impl error::Error for Error {
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum Token {
-    Whitespace,
     Comment,
     Pkg,
     And,
@@ -63,10 +66,42 @@ pub enum Token {
     BraceClose,
     BracketOpen,
     BracketClose,
-    String(String),
-    Identifier(String),
+    String(Interned<str>),
+    Identifier(Interned<str>),
 }
 
+impl Display for Token {
+    #[inline]
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                Token::Comment => "comment",
+                Token::Pkg => "\"pkg\"",
+                Token::And => "\"and\"",
+                Token::Or => "\"or\"",
+                Token::Xor => "\"xor\"",
+                Token::Not => "\"not\"",
+                Token::True => "\"true\"",
+                Token::False => "\"false\"",
+                Token::Bang => "\"!\"",
+                Token::Semi => "\";\"",
+                Token::Colon => "\":\"",
+                Token::Comma => "\",\"",
+                Token::Dot => "\".\"",
+                Token::ParenOpen => "\"(\"",
+                Token::ParenClose => "\")\"",
+                Token::BraceOpen => "\"{\"",
+                Token::BraceClose => "\"}\"",
+                Token::BracketOpen => "\"[\"",
+                Token::BracketClose => "\"]\"",
+                Token::String(_) => "\"string\"",
+                Token::Identifier(_) => "\"identifier\"",
+            }
+        )
+    }
+}
 #[derive(Debug)]
 enum State {
     Root,
@@ -77,24 +112,31 @@ enum State {
     InQuotedString,
 }
 
-struct Lexer<R> {
+pub struct Lexer<R> {
     inner: CharStream<R>,
+    pub(crate) interner: Rc<Interner<str>>,
     start_location: Location,
-    location: Location,
+    pub(crate) location: Location,
     buf: String,
-    put_back: Option<char>,
+    stash: Option<char>,
     state: State,
 }
 
 impl<R: AsyncRead + Unpin> Lexer<R> {
     #[inline]
-    fn new(reader: R) -> Lexer<R> {
+    pub fn new(reader: R) -> Lexer<R> {
+        Lexer::with_interner(reader, Rc::new(Interner::new()))
+    }
+
+    #[inline]
+    pub fn with_interner(reader: R, interner: Rc<Interner<str>>) -> Lexer<R> {
         Lexer {
             inner: reader.char_stream(),
-            start_location: Location { line: 1, column: 0 },
+            interner,
+            start_location: Location { line: 1, column: 1 },
             location: Location { line: 1, column: 0 },
             buf: String::new(),
-            put_back: None,
+            stash: None,
             state: State::Root,
         }
     }
@@ -103,14 +145,6 @@ impl<R: AsyncRead + Unpin> Lexer<R> {
 #[inline]
 fn is_identifier_start(c: char) -> bool {
     c.is_alphabetic() || c == '_'
-}
-
-/// Removes a value from an option if it exists
-#[inline]
-fn remove_option<T: Copy>(opt: &mut Option<T>) -> Option<T> {
-    let copy = *opt;
-    *opt = None;
-    copy
 }
 
 #[inline]
@@ -152,21 +186,23 @@ impl<R: AsyncRead + Unpin> Stream for Lexer<R> {
         self: Pin<&mut Lexer<R>>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<(Location, Token), Error>>> {
-        let (mut stream, start_location, location, buf, put_back, state) = {
+        let (mut stream, interner, start_location, location, buf, stash, state) = {
             let s = self.get_mut();
             (
                 Pin::new(&mut s.inner),
+                &mut s.interner,
                 &mut s.start_location,
                 &mut s.location,
                 &mut s.buf,
-                &mut s.put_back,
+                &mut s.stash,
                 &mut s.state,
             )
         };
 
-        // If we find a char that ends a token, we put it back into single char buffer.
-        // Here we try to remove that item from the buffer and if it doesn't exist, we poll.
-        match remove_option(put_back)
+        // If we find a char that ends a token, we put it back into the stash.
+        // Here we try to remove that item from the stash and if it doesn't exist, we poll.
+        match stash
+            .take()
             .map(|c| Poll::Ready(Some(Ok(c))))
             .or_else(|| {
                 // Raw number tracking from the polled stream
@@ -204,13 +240,18 @@ impl<R: AsyncRead + Unpin> Stream for Lexer<R> {
                         *start_location = *location;
                         *state = State::InUnquotedString;
                     } else if c.is_whitespace() {
+                        cx.waker().wake_by_ref();
                         return Poll::Pending;
                     } else {
                         return Poll::Ready(Some(Err(Error::IoError(
                             *location,
-                            io::Error::new(ErrorKind::InvalidInput, format!("{}", c)),
+                            io::Error::new(
+                                ErrorKind::InvalidInput,
+                                format!("invalid input \"{}\"", c),
+                            ),
                         ))));
                     }
+                    cx.waker().wake_by_ref();
                     Poll::Pending
                 }
 
@@ -219,6 +260,7 @@ impl<R: AsyncRead + Unpin> Stream for Lexer<R> {
                         *state = State::Root;
                         return Poll::Ready(Some(Ok((*start_location, Token::Comment))));
                     }
+                    cx.waker().wake_by_ref();
                     Poll::Pending
                 }
 
@@ -227,69 +269,75 @@ impl<R: AsyncRead + Unpin> Stream for Lexer<R> {
                         buf.push(c);
                     } else {
                         // save it for later
-                        *put_back = Some(c);
+                        *stash = Some(c);
                         *state = State::Root;
                         return if let Some(keyword) = check_keyword(buf.as_str()) {
                             buf.clear();
                             Poll::Ready(Some(Ok((*start_location, keyword))))
                         } else {
-                            let clone = buf.clone();
+                            let interned = interner.intern(buf.as_str()).unwrap();
                             buf.clear();
-                            Poll::Ready(Some(Ok((*start_location, Token::Identifier(clone)))))
+                            Poll::Ready(Some(Ok((*start_location, Token::Identifier(interned)))))
                         };
                     }
+                    cx.waker().wake_by_ref();
                     Poll::Pending
                 }
 
                 State::InUnquotedString => {
                     // TODO: The conditions to exit an unquoted string are ambiguous
-                    if let Some(_) = check_symbol(c) {
-                        *put_back = Some(c);
+                    if check_symbol(c).is_some() {
+                        *stash = Some(c);
                         *state = State::Root;
-                        let clone = buf.clone();
+                        let interned = interner.intern(buf.as_str()).unwrap();
                         buf.clear();
-                        return Poll::Ready(Some(Ok((*start_location, Token::String(clone)))));
+                        return Poll::Ready(Some(Ok((*start_location, Token::String(interned)))));
                     } else {
                         buf.push(c);
                     }
+                    cx.waker().wake_by_ref();
                     Poll::Pending
                 }
 
                 State::InQuotedString => {
                     if c == '"' {
                         *state = State::Root;
-                        let clone = buf.clone();
+                        let interned = interner.intern(buf.as_str()).unwrap();
                         buf.clear();
-                        return Poll::Ready(Some(Ok((*start_location, Token::String(clone)))));
+                        return Poll::Ready(Some(Ok((*start_location, Token::String(interned)))));
                     } else {
                         buf.push(c);
                     }
+                    cx.waker().wake_by_ref();
                     Poll::Pending
                 }
             },
             Poll::Ready(None) => {
                 // If we're at the end of input we might have something to flush in the buffer
-                if buf.len() == 0 {
+                if buf.is_empty() {
                     Poll::Ready(None)
                 } else {
                     match *state {
                         State::InIdentifier => {
                             *state = State::Root;
-                            return if let Some(keyword) = check_keyword(buf.as_str()) {
+                            if let Some(keyword) = check_keyword(buf.as_str()) {
                                 buf.clear();
                                 Poll::Ready(Some(Ok((*start_location, keyword))))
                             } else {
-                                let clone = buf.clone();
+                                let interned = interner.intern(buf.as_str()).unwrap();
                                 buf.clear();
-                                Poll::Ready(Some(Ok((*start_location, Token::Identifier(clone)))))
-                            };
+                                Poll::Ready(Some(Ok((
+                                    *start_location,
+                                    Token::Identifier(interned),
+                                ))))
+                            }
                         }
 
                         State::InUnquotedString => {
                             *state = State::Root;
-                            let clone = buf.clone();
+                            let interned = interner.intern(buf.as_str()).unwrap();
                             buf.clear();
-                            Poll::Ready(Some(Ok((*start_location, Token::String(clone)))))
+                            Poll::Ready(Some(Ok((*start_location, Token::String(interned)))))
                         }
 
                         _ => unreachable!(),
@@ -301,7 +349,10 @@ impl<R: AsyncRead + Unpin> Stream for Lexer<R> {
                 charstream::Error::Utf8Error(err) => Error::Utf8Error(*location, err),
                 charstream::Error::IoError(err) => Error::IoError(*location, err),
             }))),
-            Poll::Pending => Poll::Pending,
+            Poll::Pending => {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
         }
     }
 }
@@ -346,16 +397,14 @@ mod tests {
     #[test]
     fn empty() {
         let mut cx = cx();
-        let mut reader = &mut Cursor::new("");
-        let mut lexer = Lexer::new(reader);
+        let mut lexer = Lexer::new(Cursor::new(""));
         assert_none(&mut cx, &mut lexer);
     }
 
     #[test]
     fn keywords() {
         let mut cx = cx();
-        let mut reader = &mut Cursor::new("pkg and or xor not true false");
-        let mut lexer = Lexer::new(reader);
+        let mut lexer = Lexer::new(Cursor::new("pkg and or xor not true false"));
         assert_pending(&mut cx, &mut lexer);
         assert_pending(&mut cx, &mut lexer);
         assert_pending(&mut cx, &mut lexer);
@@ -411,8 +460,7 @@ mod tests {
     #[test]
     fn symbols() {
         let mut cx = cx();
-        let mut reader = &mut Cursor::new("! ; : , . ( ) { } [ ]");
-        let mut lexer = Lexer::new(reader);
+        let mut lexer = Lexer::new(Cursor::new("! ; : , . ( ) { } [ ]"));
         assert_token(&mut cx, &mut lexer, (1, 1), Token::Bang);
 
         assert_pending(&mut cx, &mut lexer);
@@ -451,8 +499,7 @@ mod tests {
     #[test]
     fn comment() {
         let mut cx = cx();
-        let mut reader = &mut Cursor::new("#test\n");
-        let mut lexer = Lexer::new(reader);
+        let mut lexer = Lexer::new(Cursor::new("#test\n"));
         assert_pending(&mut cx, &mut lexer);
         assert_pending(&mut cx, &mut lexer);
         assert_pending(&mut cx, &mut lexer);
@@ -465,43 +512,38 @@ mod tests {
     #[test]
     fn quoted_string() {
         let mut cx = cx();
-        let mut reader = &mut Cursor::new("\"test\"");
-        let mut lexer = Lexer::new(reader);
+        let mut lexer = Lexer::new(Cursor::new("\"test\""));
+        let test = lexer.interner.intern("test").unwrap();
         assert_pending(&mut cx, &mut lexer);
         assert_pending(&mut cx, &mut lexer);
         assert_pending(&mut cx, &mut lexer);
         assert_pending(&mut cx, &mut lexer);
         assert_pending(&mut cx, &mut lexer);
-        assert_token(&mut cx, &mut lexer, (1, 1), Token::String("test".into()));
+        assert_token(&mut cx, &mut lexer, (1, 1), Token::String(test));
         assert_none(&mut cx, &mut lexer);
     }
 
     #[test]
     fn identifier() {
         let mut cx = cx();
-        let mut reader = &mut Cursor::new("test");
-        let mut lexer = Lexer::new(reader);
+        let mut lexer = Lexer::new(Cursor::new("test"));
+        let test = lexer.interner.intern("test").unwrap();
         assert_pending(&mut cx, &mut lexer);
         assert_pending(&mut cx, &mut lexer);
         assert_pending(&mut cx, &mut lexer);
         assert_pending(&mut cx, &mut lexer);
-        assert_token(
-            &mut cx,
-            &mut lexer,
-            (1, 1),
-            Token::Identifier("test".into()),
-        );
+        assert_token(&mut cx, &mut lexer, (1, 1), Token::Identifier(test));
         assert_none(&mut cx, &mut lexer);
     }
 
     #[test]
     fn unquoted_string() {
         let mut cx = cx();
-        let mut reader = &mut Cursor::new("42");
-        let mut lexer = Lexer::new(reader);
+        let mut lexer = Lexer::new(Cursor::new("42"));
+        let forty_two = lexer.interner.intern("42").unwrap();
         assert_pending(&mut cx, &mut lexer);
         assert_pending(&mut cx, &mut lexer);
-        assert_token(&mut cx, &mut lexer, (1, 1), Token::String("42".into()));
+        assert_token(&mut cx, &mut lexer, (1, 1), Token::String(forty_two));
         assert_none(&mut cx, &mut lexer);
     }
 }

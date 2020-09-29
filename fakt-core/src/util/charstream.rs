@@ -3,8 +3,8 @@ use futures::{
     AsyncRead, Stream,
 };
 use std::{
-    error, fmt,
-    fmt::{Display, Formatter},
+    error,
+    fmt::{self, Display, Formatter},
     io,
     pin::Pin,
     str,
@@ -99,21 +99,22 @@ impl<'a, R: AsyncRead + Unpin> Stream for CharStream<R> {
                             .map(|s| s.chars().next().unwrap()),
                     ))
                 } else {
-                    *len = *len + 1;
+                    *len += 1;
                     // read as many as possible.
                     if let Ok(c) = str::from_utf8(&buf[0..*len]) {
                         *len = 0;
                         Poll::Ready(Some(Ok(c.chars().next().unwrap())))
                     } else {
+                        cx.waker().wake_by_ref();
                         Poll::Pending
                     }
                 }
             }
-            Poll::Ready(Err(err)) => match err.kind() {
-                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted => Poll::Pending,
-                _ => Poll::Ready(Some(Err(err.into()))),
-            },
-            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(err)) => Poll::Ready(Some(Err(err.into()))),
+            Poll::Pending => {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
         }
     }
 }
@@ -163,7 +164,7 @@ mod tests {
     #[test]
     fn single_char() {
         let mut cx = cx();
-        let mut stream = &mut Cursor::new("a").char_stream();
+        let mut stream = Cursor::new("a").char_stream();
         assert_char(&mut cx, &mut stream, 'a');
         assert_none(&mut cx, &mut stream);
     }
@@ -171,7 +172,7 @@ mod tests {
     #[test]
     fn single_multibyte_char() {
         let mut cx = cx();
-        let mut stream = &mut Cursor::new("ท").char_stream();
+        let mut stream = Cursor::new("ท").char_stream();
         // 3 byte char
         assert_pending(&mut cx, &mut stream);
         assert_pending(&mut cx, &mut stream);
@@ -182,7 +183,7 @@ mod tests {
     #[test]
     fn word() {
         let mut cx = cx();
-        let mut stream = &mut Cursor::new("hello").char_stream();
+        let mut stream = Cursor::new("hello").char_stream();
         assert_char(&mut cx, &mut stream, 'h');
         assert_char(&mut cx, &mut stream, 'e');
         assert_char(&mut cx, &mut stream, 'l');
@@ -194,7 +195,7 @@ mod tests {
     #[test]
     fn invalid_sequence() {
         let mut cx = cx();
-        let mut stream = &mut Cursor::new([0xe2, 0x28, 0xa1]).char_stream();
+        let mut stream = Cursor::new([0xe2, 0x28, 0xa1]).char_stream();
         assert_pending(&mut cx, &mut stream);
         assert_pending(&mut cx, &mut stream);
         assert_pending(&mut cx, &mut stream);
