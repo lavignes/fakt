@@ -5,7 +5,7 @@ This is the rough EBNF grammar for fakt files:
 * *Comments are excluded here but are like Python or Bash comments.* Any time a pound-sign or "hashtag" symbol `#` is encountered the rest of the
   line is ignored.
 
-```ebnf
+```
 <pkg>                  ::= "pkg" <name> (<rule-or-property>)*
 
 <name>                 ::= <identifier> ("." <identifier>)*
@@ -45,10 +45,6 @@ This is the rough EBNF grammar for fakt files:
                          | <double-quoted-string>
                          | <unquoted-string>
 
-```
-
-The regular expressions in the grammar are separated out here:
-```
 <identifier>           ::= /\p{Letter}[\p{Number}]*/
 
 <quoted-string>        ::= /'[^']*'/
