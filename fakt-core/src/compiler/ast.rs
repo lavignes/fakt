@@ -1,5 +1,5 @@
 use crate::collections::Interned;
-use std::collections::HashMap;
+use fxhash::FxHashMap;
 
 #[derive(Debug)]
 pub enum Condition {
@@ -12,10 +12,9 @@ pub enum Condition {
 
 #[derive(Debug)]
 pub enum PropertyValue {
-    Bool(bool),
     String(Interned<str>),
     Array(Vec<Interned<str>>),
-    Map(HashMap<Interned<str>, PropertyValue>),
+    Map(FxHashMap<Interned<str>, PropertyValue>),
 }
 
 #[derive(Debug)]

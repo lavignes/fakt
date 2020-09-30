@@ -93,17 +93,6 @@ impl<R: AsyncRead + Unpin> Parser<R> {
         Ok(name)
     }
 
-    async fn rule_props(&mut self) -> Result<Vec<RuleOrProperty>, Error> {
-        if let Some(result) = self.rule_props_opt().await {
-            Ok(result?)
-        } else {
-            Err(Error::SyntaxError(
-                self.lexer.location,
-                "expecting a rule".into(),
-            ))
-        }
-    }
-
     #[async_recursion::async_recursion(?Send)]
     async fn rule_props_opt(&mut self) -> Option<Result<Vec<RuleOrProperty>, Error>> {
         let mut rule_props = Vec::new();
@@ -434,14 +423,6 @@ impl<R: AsyncRead + Unpin> Parser<R> {
             } else {
                 return Ok((location, Name { parts }));
             }
-        }
-    }
-
-    async fn expect_qualified_identifier_opt(&mut self) -> Option<Result<(Location, Name), Error>> {
-        if let Some(Ok((_, Token::Identifier(_)))) = self.peek().await {
-            Some(self.expect_name().await)
-        } else {
-            None
         }
     }
 
