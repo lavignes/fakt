@@ -1,3 +1,4 @@
+use crate::compiler::ast::{Property, PropertyValue, RuleOrProperty};
 use crate::{
     collections::{Interned, Interner},
     compiler::{
@@ -49,6 +50,12 @@ impl From<lexer::Error> for Error {
     }
 }
 
+#[derive(Debug)]
+enum ConditionOrProperty {
+    Condition(Condition),
+    Property(Property),
+}
+
 struct Parser<R> {
     lexer: Lexer<R>,
     stash: Option<(Location, Token)>,
@@ -70,25 +77,24 @@ impl<R: AsyncRead + Unpin> Parser<R> {
 
     pub async fn parse(&mut self) -> Result<Package, Error> {
         let name = self.package_name().await?;
-        let rules = match self.rules_opt().await {
+        let children = match self.rule_props_opt().await {
             Some(Err(err)) => {
                 return Err(err);
             }
             Some(Ok(ok)) => Some(ok),
             None => None,
         };
-        Ok(Package { name, rules })
+        Ok(Package { name, children })
     }
 
     async fn package_name(&mut self) -> Result<Name, Error> {
         self.expect_simple_token(Token::Pkg).await?;
         let (_, name) = self.expect_name().await?;
-        self.expect_simple_token(Token::Semi).await?;
         Ok(name)
     }
 
-    async fn rules(&mut self) -> Result<Vec<Rule>, Error> {
-        if let Some(result) = self.rules_opt().await {
+    async fn rule_props(&mut self) -> Result<Vec<RuleOrProperty>, Error> {
+        if let Some(result) = self.rule_props_opt().await {
             Ok(result?)
         } else {
             Err(Error::SyntaxError(
@@ -99,11 +105,11 @@ impl<R: AsyncRead + Unpin> Parser<R> {
     }
 
     #[async_recursion::async_recursion(?Send)]
-    async fn rules_opt(&mut self) -> Option<Result<Vec<Rule>, Error>> {
-        let mut rules = Vec::new();
-        while let Some(result) = self.rule_opt().await {
+    async fn rule_props_opt(&mut self) -> Option<Result<Vec<RuleOrProperty>, Error>> {
+        let mut rule_props = Vec::new();
+        while let Some(result) = self.rule_prop_opt().await {
             match result {
-                Ok(rule) => rules.push(rule),
+                Ok(rule) => rule_props.push(rule),
                 Err(err) => {
                     return Some(Err(err));
                 }
@@ -111,21 +117,21 @@ impl<R: AsyncRead + Unpin> Parser<R> {
         }
         // There is actually no allocation for an empty vec
         //   but we signal intent here.
-        if rules.is_empty() {
+        if rule_props.is_empty() {
             None
         } else {
-            Some(Ok(rules))
+            Some(Ok(rule_props))
         }
     }
 
-    async fn rule_opt(&mut self) -> Option<Result<Rule, Error>> {
-        match self.condition_opt().await? {
-            Ok(condition) => {
+    async fn rule_prop_opt(&mut self) -> Option<Result<RuleOrProperty, Error>> {
+        match self.condition_prop_opt().await? {
+            Ok(ConditionOrProperty::Condition(condition)) => {
                 if let Err(err) = self.expect_simple_token(Token::BraceOpen).await {
                     return Some(Err(err));
                 }
-                let children = match self.rules_opt().await {
-                    Some(Ok(rules)) => Some(rules),
+                let children = match self.rule_props_opt().await {
+                    Some(Ok(rule_props)) => Some(rule_props),
                     Some(Err(err)) => {
                         return Some(Err(err));
                     }
@@ -134,18 +140,27 @@ impl<R: AsyncRead + Unpin> Parser<R> {
                 if let Err(err) = self.expect_simple_token(Token::BraceClose).await {
                     return Some(Err(err));
                 }
-                Some(Ok(Rule {
+                Some(Ok(RuleOrProperty::Rule(Rule {
                     condition,
-                    properties: None,
                     children,
-                }))
+                })))
+            }
+            Ok(ConditionOrProperty::Property(property)) => {
+                Some(Ok(RuleOrProperty::Property(property)))
             }
             Err(err) => Some(Err(err)),
         }
     }
 
     #[async_recursion::async_recursion(?Send)]
-    async fn condition(&mut self) -> Result<Condition, Error> {
+    async fn condition(&mut self, name: Option<Name>) -> Result<Condition, Error> {
+        // This is an edge-case. When parsing whether something is a rule or a property
+        //   we have to fully parse a name. If we decide that it really is a rule we
+        //   pipe that pre-parsed name down the condition parsing tree.
+        if let Some(name) = name {
+            return self.condition_lowest(Some(name)).await;
+        }
+
         let (_, tok) = match self.peek().await {
             Some(Ok(ok)) => ok,
             Some(Err(err)) => {
@@ -160,7 +175,7 @@ impl<R: AsyncRead + Unpin> Parser<R> {
         };
         match tok {
             Token::ParenOpen | Token::Identifier(_) | Token::Not | Token::Bang => {
-                self.condition_lowest().await
+                self.condition_lowest(None).await
             }
             other => Err(Error::SyntaxError(
                 self.lexer.location,
@@ -169,8 +184,8 @@ impl<R: AsyncRead + Unpin> Parser<R> {
         }
     }
 
-    async fn condition_lowest(&mut self) -> Result<Condition, Error> {
-        let low = self.condition_low().await?;
+    async fn condition_lowest(&mut self, name: Option<Name>) -> Result<Condition, Error> {
+        let lhs = self.condition_low(name).await?;
 
         let (_, tok) = match self.peek().await {
             Some(Ok(ok)) => ok,
@@ -189,16 +204,16 @@ impl<R: AsyncRead + Unpin> Parser<R> {
             Token::Or | Token::Comma => {
                 self.next().await;
                 Ok(Condition::Or(
-                    Box::new(low),
-                    Box::new(self.condition_low().await?),
+                    Box::new(lhs),
+                    Box::new(self.condition_low(None).await?),
                 ))
             }
-            _ => Ok(low),
+            _ => Ok(lhs),
         }
     }
 
-    async fn condition_low(&mut self) -> Result<Condition, Error> {
-        let low = self.condition_high().await?;
+    async fn condition_low(&mut self, name: Option<Name>) -> Result<Condition, Error> {
+        let lhs = self.condition_high(name).await?;
 
         let (_, tok) = match self.peek().await {
             Some(Ok(ok)) => ok,
@@ -217,16 +232,16 @@ impl<R: AsyncRead + Unpin> Parser<R> {
             Token::Xor => {
                 self.next().await;
                 Ok(Condition::Xor(
-                    Box::new(low),
-                    Box::new(self.condition_high().await?),
+                    Box::new(lhs),
+                    Box::new(self.condition_high(None).await?),
                 ))
             }
-            _ => Ok(low),
+            _ => Ok(lhs),
         }
     }
 
-    async fn condition_high(&mut self) -> Result<Condition, Error> {
-        let high = self.condition_highest().await?;
+    async fn condition_high(&mut self, name: Option<Name>) -> Result<Condition, Error> {
+        let lhs = self.condition_highest(name).await?;
 
         let (_, tok) = match self.peek().await {
             Some(Ok(ok)) => ok,
@@ -249,16 +264,27 @@ impl<R: AsyncRead + Unpin> Parser<R> {
                     self.next().await;
                 }
                 Ok(Condition::And(
-                    Box::new(high),
-                    Box::new(self.condition().await?),
+                    Box::new(lhs),
+                    Box::new(self.condition_highest(None).await?),
                 ))
             }
-            _ => Ok(high),
+            _ => Ok(lhs),
         }
     }
 
     #[async_recursion::async_recursion(?Send)]
-    async fn condition_highest(&mut self) -> Result<Condition, Error> {
+    async fn condition_highest(&mut self, name: Option<Name>) -> Result<Condition, Error> {
+        if let Some(name) = name {
+            let args = match self.args_opt().await {
+                Some(Ok(rules)) => Some(rules),
+                Some(Err(err)) => {
+                    return Err(err);
+                }
+                None => None,
+            };
+            return Ok(Condition::Fact(name, args));
+        }
+
         let (_, tok) = match self.peek().await {
             Some(Ok(ok)) => ok,
             Some(Err(err)) => {
@@ -275,11 +301,13 @@ impl<R: AsyncRead + Unpin> Parser<R> {
         match tok {
             Token::Bang | Token::Not => {
                 self.next().await;
-                Ok(Condition::Not(Box::new(self.condition_highest().await?)))
+                Ok(Condition::Not(Box::new(
+                    self.condition_highest(None).await?,
+                )))
             }
             Token::ParenOpen => {
                 self.next().await;
-                let cond = self.condition().await?;
+                let cond = self.condition(None).await?;
                 self.expect_simple_token(Token::ParenClose).await?;
                 Ok(cond)
             }
@@ -301,7 +329,7 @@ impl<R: AsyncRead + Unpin> Parser<R> {
         }
     }
 
-    async fn condition_opt(&mut self) -> Option<Result<Condition, Error>> {
+    async fn condition_prop_opt(&mut self) -> Option<Result<ConditionOrProperty, Error>> {
         let (_, tok) = match self.peek().await? {
             Ok(ok) => ok,
             Err(err) => {
@@ -309,8 +337,41 @@ impl<R: AsyncRead + Unpin> Parser<R> {
             }
         };
         match tok {
-            Token::ParenOpen | Token::Not | Token::Bang | Token::Identifier(_) => {
-                Some(self.condition().await)
+            Token::ParenOpen | Token::Not | Token::Bang => Some(
+                self.condition(None)
+                    .await
+                    .map(ConditionOrProperty::Condition),
+            ),
+            Token::Identifier(_) => {
+                // We have to check ahead a bit before we can decide whether a name
+                //   refers to a rule or property
+                let (_, name) = match self.expect_name().await {
+                    Ok(ok) => ok,
+                    Err(err) => {
+                        return Some(Err(err));
+                    }
+                };
+                match self.expect_simple_token_opt(Token::Colon).await {
+                    Some(Ok(_)) => {
+                        // TODO: Property value other than string
+                        let (_, value) = match self.expect_string().await {
+                            Ok(ok) => ok,
+                            Err(err) => {
+                                return Some(Err(err));
+                            }
+                        };
+                        Some(Ok(ConditionOrProperty::Property(Property {
+                            name,
+                            value: PropertyValue::String(value),
+                        })))
+                    }
+                    Some(Err(err)) => Some(Err(err)),
+                    None => Some(
+                        self.condition(Some(name))
+                            .await
+                            .map(ConditionOrProperty::Condition),
+                    ),
+                }
             }
             _ => None,
         }
@@ -318,8 +379,10 @@ impl<R: AsyncRead + Unpin> Parser<R> {
 
     async fn args_opt(&mut self) -> Option<Result<Vec<Interned<str>>, Error>> {
         match self.expect_simple_token_opt(Token::BracketOpen).await {
-            Some(Err(err)) => return Some(Err(err)),
             Some(Ok(_)) => {}
+            Some(Err(err)) => {
+                return Some(Err(err));
+            }
             None => {
                 return None;
             }
@@ -475,10 +538,16 @@ impl<R: AsyncRead + Unpin> Parser<R> {
         if let Some(stash) = self.stash.take() {
             return Some(Ok(stash));
         }
-        if let Some(result) = self.lexer.next().await {
-            Some(result.map_err(Error::from))
-        } else {
-            None
+        loop {
+            match self.lexer.next().await {
+                Some(Ok((_, Token::Comment))) => continue,
+                Some(result) => {
+                    return Some(result.map_err(Error::from));
+                }
+                None => {
+                    return None;
+                }
+            }
         }
     }
 }
@@ -487,6 +556,7 @@ impl<R: AsyncRead + Unpin> Parser<R> {
 mod tests {
     use super::*;
     use crate::collections::Interned;
+    use crate::compiler::ast::PropertyValue;
     use futures::{executor, io::Cursor};
 
     fn assert_syntax_err(result: Result<Package, Error>, location: (usize, usize), msg: &str) {
@@ -499,7 +569,7 @@ mod tests {
     }
 
     fn assert_str(interner: &Interner<str>, s: &str, interned: Interned<str>) {
-        assert_eq!(Some(s), interner.get(interned));
+        assert_eq!(Some(true), interner.eq(s, interned));
     }
 
     fn assert_name(interner: &Interner<str>, s: &str, name: &Name) {
@@ -527,15 +597,8 @@ mod tests {
     }
 
     #[test]
-    fn package_no_semicolon() {
-        let mut p = Parser::new(Cursor::new("pkg hello"));
-        let result = executor::block_on(p.parse());
-        assert_syntax_err(result, (1, 9), "unexpected end of input, expected \";\"");
-    }
-
-    #[test]
     fn empty_package() {
-        let mut p = Parser::new(Cursor::new("pkg hello.world;"));
+        let mut p = Parser::new(Cursor::new("pkg hello.world"));
         let pkg = executor::block_on(p.parse()).unwrap();
         assert_name(&p.lexer.interner, "hello.world", &pkg.name);
     }
@@ -544,7 +607,7 @@ mod tests {
     fn simple_rule() {
         let mut p = Parser::new(Cursor::new(
             r#"
-            pkg hello.world;
+            pkg hello.world
             
             simple {}
             "#,
@@ -552,20 +615,80 @@ mod tests {
         let pkg = executor::block_on(p.parse()).unwrap();
         assert_name(&p.lexer.interner, "hello.world", &pkg.name);
 
-        let rule = &pkg.rules.unwrap()[0];
-        assert!(matches!(rule.condition, Condition::Fact(_, None)));
-        if let Condition::Fact(ident, _) = &rule.condition {
-            assert_name(&p.lexer.interner, "simple", ident);
+        let rule = &pkg.children.unwrap()[0];
+        assert!(matches!(rule, RuleOrProperty::Rule(_)));
+        if let RuleOrProperty::Rule(rule) = rule {
+            assert!(matches!(rule.condition, Condition::Fact(_, None)));
+            if let Condition::Fact(ident, _) = &rule.condition {
+                assert_name(&p.lexer.interner, "simple", ident);
+            }
+            assert!(matches!(rule.children, None));
         }
-        assert!(matches!(rule.children, None));
-        assert!(matches!(rule.properties, None));
+    }
+
+    #[test]
+    fn simple_prop() {
+        let mut p = Parser::new(Cursor::new(
+            r#"
+            pkg hello.world
+            
+            prop.name: 12345
+            "#,
+        ));
+        let pkg = executor::block_on(p.parse()).unwrap();
+        assert_name(&p.lexer.interner, "hello.world", &pkg.name);
+
+        let prop = &pkg.children.unwrap()[0];
+        assert!(matches!(prop, RuleOrProperty::Property(_)));
+        if let RuleOrProperty::Property(prop) = prop {
+            assert_name(&p.lexer.interner, "prop.name", &prop.name);
+            assert!(matches!(prop.value, PropertyValue::String(_)));
+            if let PropertyValue::String(value) = prop.value {
+                assert_str(&p.lexer.interner, "12345", value);
+            }
+        }
+    }
+
+    #[test]
+    fn multiple_simple_props() {
+        let mut p = Parser::new(Cursor::new(
+            r#"
+            pkg hello.world
+            
+            prop.name1: 12345
+            prop.name2: "hello!"
+            "#,
+        ));
+        let pkg = executor::block_on(p.parse()).unwrap();
+        assert_name(&p.lexer.interner, "hello.world", &pkg.name);
+
+        let children = &pkg.children.unwrap();
+        let prop = &children[0];
+        assert!(matches!(prop, RuleOrProperty::Property(_)));
+        if let RuleOrProperty::Property(prop) = prop {
+            assert_name(&p.lexer.interner, "prop.name1", &prop.name);
+            assert!(matches!(prop.value, PropertyValue::String(_)));
+            if let PropertyValue::String(value) = prop.value {
+                assert_str(&p.lexer.interner, "12345", value);
+            }
+        }
+
+        let prop = &children[1];
+        assert!(matches!(prop, RuleOrProperty::Property(_)));
+        if let RuleOrProperty::Property(prop) = prop {
+            assert_name(&p.lexer.interner, "prop.name2", &prop.name);
+            assert!(matches!(prop.value, PropertyValue::String(_)));
+            if let PropertyValue::String(value) = prop.value {
+                assert_str(&p.lexer.interner, "hello!", value);
+            }
+        }
     }
 
     #[test]
     fn recursive_rule() {
         let mut p = Parser::new(Cursor::new(
             r#"
-            pkg hello.world;
+            pkg hello.world
             
             level1 { level2 {} }
             "#,
@@ -573,22 +696,87 @@ mod tests {
         let pkg = executor::block_on(p.parse()).unwrap();
         assert_name(&p.lexer.interner, "hello.world", &pkg.name);
 
-        let rule = &pkg.rules.unwrap()[0];
-        assert!(matches!(rule.condition, Condition::Fact(_, None)));
-        if let Condition::Fact(ident, _) = &rule.condition {
-            assert_name(&p.lexer.interner, "level1", ident);
-        }
-        assert!(matches!(rule.children, Some(_)));
-        assert!(matches!(rule.properties, None));
-
-        if let Some(children) = &rule.children {
-            let rule = &children[0];
+        let rule = &pkg.children.unwrap()[0];
+        assert!(matches!(rule, RuleOrProperty::Rule(_)));
+        if let RuleOrProperty::Rule(rule) = rule {
             assert!(matches!(rule.condition, Condition::Fact(_, None)));
             if let Condition::Fact(ident, _) = &rule.condition {
-                assert_name(&p.lexer.interner, "level2", ident);
+                assert_name(&p.lexer.interner, "level1", ident);
             }
-            assert!(matches!(rule.children, None));
-            assert!(matches!(rule.properties, None));
+            assert!(matches!(rule.children, Some(_)));
+
+            if let Some(children) = &rule.children {
+                let rule = &children[0];
+                assert!(matches!(rule, RuleOrProperty::Rule(_)));
+                if let RuleOrProperty::Rule(rule) = rule {
+                    assert!(matches!(rule.condition, Condition::Fact(_, None)));
+                    if let Condition::Fact(ident, _) = &rule.condition {
+                        assert_name(&p.lexer.interner, "level2", ident);
+                    }
+                    assert!(matches!(rule.children, None));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn recursive_rule_with_props() {
+        let mut p = Parser::new(Cursor::new(
+            r#"
+            pkg hello.world
+            
+            level1 {
+                level1.prop: hello
+                level2 {
+                    level2.prop: world
+                }
+            }
+            "#,
+        ));
+        let pkg = executor::block_on(p.parse()).unwrap();
+        assert_name(&p.lexer.interner, "hello.world", &pkg.name);
+
+        let rule = &pkg.children.unwrap()[0];
+        assert!(matches!(rule, RuleOrProperty::Rule(_)));
+        if let RuleOrProperty::Rule(rule) = rule {
+            assert!(matches!(rule.condition, Condition::Fact(_, None)));
+            if let Condition::Fact(ident, _) = &rule.condition {
+                assert_name(&p.lexer.interner, "level1", ident);
+            }
+            assert!(matches!(rule.children, Some(_)));
+
+            if let Some(children) = &rule.children {
+                let prop = &children[0];
+                assert!(matches!(prop, RuleOrProperty::Property(_)));
+                if let RuleOrProperty::Property(prop) = prop {
+                    assert_name(&p.lexer.interner, "level1.prop", &prop.name);
+                    assert!(matches!(prop.value, PropertyValue::String(_)));
+                    if let PropertyValue::String(value) = prop.value {
+                        assert_str(&p.lexer.interner, "hello", value);
+                    }
+                }
+
+                let rule = &children[1];
+                assert!(matches!(rule, RuleOrProperty::Rule(_)));
+                if let RuleOrProperty::Rule(rule) = rule {
+                    assert!(matches!(rule.condition, Condition::Fact(_, None)));
+                    if let Condition::Fact(ident, _) = &rule.condition {
+                        assert_name(&p.lexer.interner, "level2", ident);
+                    }
+                    assert!(matches!(rule.children, Some(_)));
+                    if let Some(children) = &rule.children {
+                        let prop = &children[0];
+                        assert!(matches!(prop, RuleOrProperty::Property(_)));
+                        if let RuleOrProperty::Property(prop) = prop {
+                            assert_name(&p.lexer.interner, "level2.prop", &prop.name);
+                            assert!(matches!(prop.value, PropertyValue::String(_)));
+                            if let PropertyValue::String(value) = prop.value {
+                                assert_str(&p.lexer.interner, "world", value);
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -596,24 +784,27 @@ mod tests {
     fn explicit_and() {
         let mut p = Parser::new(Cursor::new(
             r#"
-            pkg hello.world;
+            pkg hello.world
             
-            lhs and rhs {} 
+            lhs and rhs { } 
             "#,
         ));
         let pkg = executor::block_on(p.parse()).unwrap();
         assert_name(&p.lexer.interner, "hello.world", &pkg.name);
 
-        let rule = &pkg.rules.unwrap()[0];
-        assert!(matches!(rule.condition, Condition::And(_, _)));
-        if let Condition::And(lhs, rhs) = &rule.condition {
-            assert!(matches!(**lhs, Condition::Fact(_, None)));
-            if let Condition::Fact(ident, _) = &**lhs {
-                assert_name(&p.lexer.interner, "lhs", ident);
-            }
-            assert!(matches!(**rhs, Condition::Fact(_, None)));
-            if let Condition::Fact(ident, _) = &**rhs {
-                assert_name(&p.lexer.interner, "rhs", ident);
+        let rule = &pkg.children.unwrap()[0];
+        assert!(matches!(rule, RuleOrProperty::Rule(_)));
+        if let RuleOrProperty::Rule(rule) = rule {
+            assert!(matches!(rule.condition, Condition::And(_, _)));
+            if let Condition::And(lhs, rhs) = &rule.condition {
+                assert!(matches!(**lhs, Condition::Fact(_, None)));
+                if let Condition::Fact(ident, _) = &**lhs {
+                    assert_name(&p.lexer.interner, "lhs", ident);
+                }
+                assert!(matches!(**rhs, Condition::Fact(_, None)));
+                if let Condition::Fact(ident, _) = &**rhs {
+                    assert_name(&p.lexer.interner, "rhs", ident);
+                }
             }
         }
     }
@@ -622,7 +813,7 @@ mod tests {
     fn implicit_and() {
         let mut p = Parser::new(Cursor::new(
             r#"
-            pkg hello.world;
+            pkg hello.world
             
             lhs rhs {} 
             "#,
@@ -630,16 +821,19 @@ mod tests {
         let pkg = executor::block_on(p.parse()).unwrap();
         assert_name(&p.lexer.interner, "hello.world", &pkg.name);
 
-        let rule = &pkg.rules.unwrap()[0];
-        assert!(matches!(rule.condition, Condition::And(_, _)));
-        if let Condition::And(lhs, rhs) = &rule.condition {
-            assert!(matches!(**lhs, Condition::Fact(_, None)));
-            if let Condition::Fact(ident, _) = &**lhs {
-                assert_name(&p.lexer.interner, "lhs", ident);
-            }
-            assert!(matches!(**rhs, Condition::Fact(_, None)));
-            if let Condition::Fact(ident, _) = &**rhs {
-                assert_name(&p.lexer.interner, "rhs", ident);
+        let rule = &pkg.children.unwrap()[0];
+        assert!(matches!(rule, RuleOrProperty::Rule(_)));
+        if let RuleOrProperty::Rule(rule) = rule {
+            assert!(matches!(rule.condition, Condition::And(_, _)));
+            if let Condition::And(lhs, rhs) = &rule.condition {
+                assert!(matches!(**lhs, Condition::Fact(_, None)));
+                if let Condition::Fact(ident, _) = &**lhs {
+                    assert_name(&p.lexer.interner, "lhs", ident);
+                }
+                assert!(matches!(**rhs, Condition::Fact(_, None)));
+                if let Condition::Fact(ident, _) = &**rhs {
+                    assert_name(&p.lexer.interner, "rhs", ident);
+                }
             }
         }
     }
@@ -648,7 +842,7 @@ mod tests {
     fn explicit_or() {
         let mut p = Parser::new(Cursor::new(
             r#"
-            pkg hello.world;
+            pkg hello.world
             
             lhs or rhs {} 
             "#,
@@ -656,16 +850,19 @@ mod tests {
         let pkg = executor::block_on(p.parse()).unwrap();
         assert_name(&p.lexer.interner, "hello.world", &pkg.name);
 
-        let rule = &pkg.rules.unwrap()[0];
-        assert!(matches!(rule.condition, Condition::Or(_, _)));
-        if let Condition::Or(lhs, rhs) = &rule.condition {
-            assert!(matches!(**lhs, Condition::Fact(_, None)));
-            if let Condition::Fact(ident, _) = &**lhs {
-                assert_name(&p.lexer.interner, "lhs", ident);
-            }
-            assert!(matches!(**rhs, Condition::Fact(_, None)));
-            if let Condition::Fact(ident, _) = &**rhs {
-                assert_name(&p.lexer.interner, "rhs", ident);
+        let rule = &pkg.children.unwrap()[0];
+        assert!(matches!(rule, RuleOrProperty::Rule(_)));
+        if let RuleOrProperty::Rule(rule) = rule {
+            assert!(matches!(rule.condition, Condition::Or(_, _)));
+            if let Condition::Or(lhs, rhs) = &rule.condition {
+                assert!(matches!(**lhs, Condition::Fact(_, None)));
+                if let Condition::Fact(ident, _) = &**lhs {
+                    assert_name(&p.lexer.interner, "lhs", ident);
+                }
+                assert!(matches!(**rhs, Condition::Fact(_, None)));
+                if let Condition::Fact(ident, _) = &**rhs {
+                    assert_name(&p.lexer.interner, "rhs", ident);
+                }
             }
         }
     }
@@ -674,7 +871,7 @@ mod tests {
     fn comma_or() {
         let mut p = Parser::new(Cursor::new(
             r#"
-            pkg hello.world;
+            pkg hello.world
             
             lhs, rhs {} 
             "#,
@@ -682,16 +879,19 @@ mod tests {
         let pkg = executor::block_on(p.parse()).unwrap();
         assert_name(&p.lexer.interner, "hello.world", &pkg.name);
 
-        let rule = &pkg.rules.unwrap()[0];
-        assert!(matches!(rule.condition, Condition::Or(_, _)));
-        if let Condition::Or(lhs, rhs) = &rule.condition {
-            assert!(matches!(**lhs, Condition::Fact(_, None)));
-            if let Condition::Fact(ident, _) = &**lhs {
-                assert_name(&p.lexer.interner, "lhs", ident);
-            }
-            assert!(matches!(**rhs, Condition::Fact(_, None)));
-            if let Condition::Fact(ident, _) = &**rhs {
-                assert_name(&p.lexer.interner, "rhs", ident);
+        let rule = &pkg.children.unwrap()[0];
+        assert!(matches!(rule, RuleOrProperty::Rule(_)));
+        if let RuleOrProperty::Rule(rule) = rule {
+            assert!(matches!(rule.condition, Condition::Or(_, _)));
+            if let Condition::Or(lhs, rhs) = &rule.condition {
+                assert!(matches!(**lhs, Condition::Fact(_, None)));
+                if let Condition::Fact(ident, _) = &**lhs {
+                    assert_name(&p.lexer.interner, "lhs", ident);
+                }
+                assert!(matches!(**rhs, Condition::Fact(_, None)));
+                if let Condition::Fact(ident, _) = &**rhs {
+                    assert_name(&p.lexer.interner, "rhs", ident);
+                }
             }
         }
     }
@@ -700,7 +900,7 @@ mod tests {
     fn explicit_xor() {
         let mut p = Parser::new(Cursor::new(
             r#"
-            pkg hello.world;
+            pkg hello.world
             
             lhs xor rhs {} 
             "#,
@@ -708,16 +908,19 @@ mod tests {
         let pkg = executor::block_on(p.parse()).unwrap();
         assert_name(&p.lexer.interner, "hello.world", &pkg.name);
 
-        let rule = &pkg.rules.unwrap()[0];
-        assert!(matches!(rule.condition, Condition::Xor(_, _)));
-        if let Condition::Xor(lhs, rhs) = &rule.condition {
-            assert!(matches!(**lhs, Condition::Fact(_, None)));
-            if let Condition::Fact(ident, _) = &**lhs {
-                assert_name(&p.lexer.interner, "lhs", ident);
-            }
-            assert!(matches!(**rhs, Condition::Fact(_, None)));
-            if let Condition::Fact(ident, _) = &**rhs {
-                assert_name(&p.lexer.interner, "rhs", ident);
+        let rule = &pkg.children.unwrap()[0];
+        assert!(matches!(rule, RuleOrProperty::Rule(_)));
+        if let RuleOrProperty::Rule(rule) = rule {
+            assert!(matches!(rule.condition, Condition::Xor(_, _)));
+            if let Condition::Xor(lhs, rhs) = &rule.condition {
+                assert!(matches!(**lhs, Condition::Fact(_, None)));
+                if let Condition::Fact(ident, _) = &**lhs {
+                    assert_name(&p.lexer.interner, "lhs", ident);
+                }
+                assert!(matches!(**rhs, Condition::Fact(_, None)));
+                if let Condition::Fact(ident, _) = &**rhs {
+                    assert_name(&p.lexer.interner, "rhs", ident);
+                }
             }
         }
     }
@@ -726,7 +929,7 @@ mod tests {
     fn not() {
         let mut p = Parser::new(Cursor::new(
             r#"
-            pkg hello.world;
+            pkg hello.world
             
             not simple {} 
             "#,
@@ -734,12 +937,15 @@ mod tests {
         let pkg = executor::block_on(p.parse()).unwrap();
         assert_name(&p.lexer.interner, "hello.world", &pkg.name);
 
-        let rule = &pkg.rules.unwrap()[0];
-        assert!(matches!(rule.condition, Condition::Not(_)));
-        if let Condition::Not(rule) = &rule.condition {
-            assert!(matches!(**rule, Condition::Fact(_, None)));
-            if let Condition::Fact(ident, _) = &**rule {
-                assert_name(&p.lexer.interner, "simple", ident);
+        let rule = &pkg.children.unwrap()[0];
+        assert!(matches!(rule, RuleOrProperty::Rule(_)));
+        if let RuleOrProperty::Rule(rule) = rule {
+            assert!(matches!(rule.condition, Condition::Not(_)));
+            if let Condition::Not(rule) = &rule.condition {
+                assert!(matches!(**rule, Condition::Fact(_, None)));
+                if let Condition::Fact(ident, _) = &**rule {
+                    assert_name(&p.lexer.interner, "simple", ident);
+                }
             }
         }
     }
@@ -748,7 +954,7 @@ mod tests {
     fn parens() {
         let mut p = Parser::new(Cursor::new(
             r#"
-            pkg hello.world;
+            pkg hello.world
             
             (lhs rhs) {} 
             "#,
@@ -756,16 +962,19 @@ mod tests {
         let pkg = executor::block_on(p.parse()).unwrap();
         assert_name(&p.lexer.interner, "hello.world", &pkg.name);
 
-        let rule = &pkg.rules.unwrap()[0];
-        assert!(matches!(rule.condition, Condition::And(_, _)));
-        if let Condition::And(lhs, rhs) = &rule.condition {
-            assert!(matches!(**lhs, Condition::Fact(_, None)));
-            if let Condition::Fact(ident, _) = &**lhs {
-                assert_name(&p.lexer.interner, "lhs", ident);
-            }
-            assert!(matches!(**rhs, Condition::Fact(_, None)));
-            if let Condition::Fact(ident, _) = &**rhs {
-                assert_name(&p.lexer.interner, "rhs", ident);
+        let rule = &pkg.children.unwrap()[0];
+        assert!(matches!(rule, RuleOrProperty::Rule(_)));
+        if let RuleOrProperty::Rule(rule) = rule {
+            assert!(matches!(rule.condition, Condition::And(_, _)));
+            if let Condition::And(lhs, rhs) = &rule.condition {
+                assert!(matches!(**lhs, Condition::Fact(_, None)));
+                if let Condition::Fact(ident, _) = &**lhs {
+                    assert_name(&p.lexer.interner, "lhs", ident);
+                }
+                assert!(matches!(**rhs, Condition::Fact(_, None)));
+                if let Condition::Fact(ident, _) = &**rhs {
+                    assert_name(&p.lexer.interner, "rhs", ident);
+                }
             }
         }
     }
@@ -774,7 +983,7 @@ mod tests {
     fn precendence1() {
         let mut p = Parser::new(Cursor::new(
             r#"
-            pkg hello.world;
+            pkg hello.world
             
             one or two and three {} 
             "#,
@@ -782,22 +991,25 @@ mod tests {
         let pkg = executor::block_on(p.parse()).unwrap();
         assert_name(&p.lexer.interner, "hello.world", &pkg.name);
 
-        let rule = &pkg.rules.unwrap()[0];
-        assert!(matches!(rule.condition, Condition::Or(_, _)));
-        if let Condition::Or(lhs, rhs) = &rule.condition {
-            assert!(matches!(**lhs, Condition::Fact(_, None)));
-            if let Condition::Fact(ident, _) = &**lhs {
-                assert_name(&p.lexer.interner, "one", ident);
-            }
-            assert!(matches!(**rhs, Condition::And(_, _)));
-            if let Condition::And(lhs, rhs) = &**rhs {
+        let rule = &pkg.children.unwrap()[0];
+        assert!(matches!(rule, RuleOrProperty::Rule(_)));
+        if let RuleOrProperty::Rule(rule) = rule {
+            assert!(matches!(rule.condition, Condition::Or(_, _)));
+            if let Condition::Or(lhs, rhs) = &rule.condition {
                 assert!(matches!(**lhs, Condition::Fact(_, None)));
                 if let Condition::Fact(ident, _) = &**lhs {
-                    assert_name(&p.lexer.interner, "two", ident);
+                    assert_name(&p.lexer.interner, "one", ident);
                 }
-                assert!(matches!(**rhs, Condition::Fact(_, None)));
-                if let Condition::Fact(ident, _) = &**rhs {
-                    assert_name(&p.lexer.interner, "three", ident);
+                assert!(matches!(**rhs, Condition::And(_, _)));
+                if let Condition::And(lhs, rhs) = &**rhs {
+                    assert!(matches!(**lhs, Condition::Fact(_, None)));
+                    if let Condition::Fact(ident, _) = &**lhs {
+                        assert_name(&p.lexer.interner, "two", ident);
+                    }
+                    assert!(matches!(**rhs, Condition::Fact(_, None)));
+                    if let Condition::Fact(ident, _) = &**rhs {
+                        assert_name(&p.lexer.interner, "three", ident);
+                    }
                 }
             }
         }
@@ -807,7 +1019,7 @@ mod tests {
     fn precendence2() {
         let mut p = Parser::new(Cursor::new(
             r#"
-            pkg hello.world;
+            pkg hello.world
             
             one or two xor three {} 
             "#,
@@ -815,18 +1027,89 @@ mod tests {
         let pkg = executor::block_on(p.parse()).unwrap();
         assert_name(&p.lexer.interner, "hello.world", &pkg.name);
 
-        let rule = &pkg.rules.unwrap()[0];
-        assert!(matches!(rule.condition, Condition::Or(_, _)));
-        if let Condition::Or(lhs, rhs) = &rule.condition {
-            assert!(matches!(**lhs, Condition::Fact(_, None)));
-            if let Condition::Fact(ident, _) = &**lhs {
-                assert_name(&p.lexer.interner, "one", ident);
-            }
-            assert!(matches!(**rhs, Condition::Xor(_, _)));
-            if let Condition::Xor(lhs, rhs) = &**rhs {
+        let rule = &pkg.children.unwrap()[0];
+        assert!(matches!(rule, RuleOrProperty::Rule(_)));
+        if let RuleOrProperty::Rule(rule) = rule {
+            assert!(matches!(rule.condition, Condition::Or(_, _)));
+            if let Condition::Or(lhs, rhs) = &rule.condition {
                 assert!(matches!(**lhs, Condition::Fact(_, None)));
                 if let Condition::Fact(ident, _) = &**lhs {
-                    assert_name(&p.lexer.interner, "two", ident);
+                    assert_name(&p.lexer.interner, "one", ident);
+                }
+                assert!(matches!(**rhs, Condition::Xor(_, _)));
+                if let Condition::Xor(lhs, rhs) = &**rhs {
+                    assert!(matches!(**lhs, Condition::Fact(_, None)));
+                    if let Condition::Fact(ident, _) = &**lhs {
+                        assert_name(&p.lexer.interner, "two", ident);
+                    }
+                    assert!(matches!(**rhs, Condition::Fact(_, None)));
+                    if let Condition::Fact(ident, _) = &**rhs {
+                        assert_name(&p.lexer.interner, "three", ident);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn precendence3() {
+        let mut p = Parser::new(Cursor::new(
+            r#"
+            pkg hello.world
+            
+            not lhs or rhs {} 
+            "#,
+        ));
+        let pkg = executor::block_on(p.parse()).unwrap();
+        assert_name(&p.lexer.interner, "hello.world", &pkg.name);
+
+        let rule = &pkg.children.unwrap()[0];
+        assert!(matches!(rule, RuleOrProperty::Rule(_)));
+        if let RuleOrProperty::Rule(rule) = rule {
+            assert!(matches!(rule.condition, Condition::Or(_, _)));
+            if let Condition::Or(lhs, rhs) = &rule.condition {
+                assert!(matches!(**lhs, Condition::Not(_)));
+                if let Condition::Not(rule) = &**lhs {
+                    assert!(matches!(**rule, Condition::Fact(_, None)));
+                    if let Condition::Fact(ident, _) = &**rule {
+                        assert_name(&p.lexer.interner, "lhs", ident);
+                    }
+                }
+                assert!(matches!(**rhs, Condition::Fact(_, None)));
+                if let Condition::Fact(ident, _) = &**rhs {
+                    assert_name(&p.lexer.interner, "rhs", ident);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn precendence_parens() {
+        let mut p = Parser::new(Cursor::new(
+            r#"
+            pkg hello.world
+            
+            (one or two) xor three {} 
+            "#,
+        ));
+        let pkg = executor::block_on(p.parse()).unwrap();
+        assert_name(&p.lexer.interner, "hello.world", &pkg.name);
+
+        let rule = &pkg.children.unwrap()[0];
+        assert!(matches!(rule, RuleOrProperty::Rule(_)));
+        if let RuleOrProperty::Rule(rule) = rule {
+            assert!(matches!(rule.condition, Condition::Xor(_, _)));
+            if let Condition::Xor(lhs, rhs) = &rule.condition {
+                assert!(matches!(**lhs, Condition::Or(_, _)));
+                if let Condition::Or(lhs, rhs) = &**lhs {
+                    assert!(matches!(**lhs, Condition::Fact(_, None)));
+                    if let Condition::Fact(ident, _) = &**lhs {
+                        assert_name(&p.lexer.interner, "one", ident);
+                    }
+                    assert!(matches!(**rhs, Condition::Fact(_, None)));
+                    if let Condition::Fact(ident, _) = &**rhs {
+                        assert_name(&p.lexer.interner, "two", ident);
+                    }
                 }
                 assert!(matches!(**rhs, Condition::Fact(_, None)));
                 if let Condition::Fact(ident, _) = &**rhs {
@@ -837,72 +1120,10 @@ mod tests {
     }
 
     #[test]
-    fn precendence3() {
-        let mut p = Parser::new(Cursor::new(
-            r#"
-            pkg hello.world;
-            
-            not lhs or rhs {} 
-            "#,
-        ));
-        let pkg = executor::block_on(p.parse()).unwrap();
-        assert_name(&p.lexer.interner, "hello.world", &pkg.name);
-
-        let rule = &pkg.rules.unwrap()[0];
-        assert!(matches!(rule.condition, Condition::Or(_, _)));
-        if let Condition::Or(lhs, rhs) = &rule.condition {
-            assert!(matches!(**lhs, Condition::Not(_)));
-            if let Condition::Not(rule) = &**lhs {
-                assert!(matches!(**rule, Condition::Fact(_, None)));
-                if let Condition::Fact(ident, _) = &**rule {
-                    assert_name(&p.lexer.interner, "lhs", ident);
-                }
-            }
-            assert!(matches!(**rhs, Condition::Fact(_, None)));
-            if let Condition::Fact(ident, _) = &**rhs {
-                assert_name(&p.lexer.interner, "rhs", ident);
-            }
-        }
-    }
-
-    #[test]
-    fn precendence_parens() {
-        let mut p = Parser::new(Cursor::new(
-            r#"
-            pkg hello.world;
-            
-            (one or two) xor three {} 
-            "#,
-        ));
-        let pkg = executor::block_on(p.parse()).unwrap();
-        assert_name(&p.lexer.interner, "hello.world", &pkg.name);
-
-        let rule = &pkg.rules.unwrap()[0];
-        assert!(matches!(rule.condition, Condition::Xor(_, _)));
-        if let Condition::Xor(lhs, rhs) = &rule.condition {
-            assert!(matches!(**lhs, Condition::Or(_, _)));
-            if let Condition::Or(lhs, rhs) = &**lhs {
-                assert!(matches!(**lhs, Condition::Fact(_, None)));
-                if let Condition::Fact(ident, _) = &**lhs {
-                    assert_name(&p.lexer.interner, "one", ident);
-                }
-                assert!(matches!(**rhs, Condition::Fact(_, None)));
-                if let Condition::Fact(ident, _) = &**rhs {
-                    assert_name(&p.lexer.interner, "two", ident);
-                }
-            }
-            assert!(matches!(**rhs, Condition::Fact(_, None)));
-            if let Condition::Fact(ident, _) = &**rhs {
-                assert_name(&p.lexer.interner, "three", ident);
-            }
-        }
-    }
-
-    #[test]
     fn one_arg() {
         let mut p = Parser::new(Cursor::new(
             r#"
-            pkg hello.world;
+            pkg hello.world
             
             simple[arg0] {}
             "#,
@@ -910,23 +1131,25 @@ mod tests {
         let pkg = executor::block_on(p.parse()).unwrap();
         assert_name(&p.lexer.interner, "hello.world", &pkg.name);
 
-        let rule = &pkg.rules.unwrap()[0];
-        assert!(matches!(rule.condition, Condition::Fact(_, Some(_))));
-        if let Condition::Fact(ident, args) = &rule.condition {
-            assert_name(&p.lexer.interner, "simple", ident);
-            if let Some(args) = args {
-                assert_str(&p.lexer.interner, "arg0", args[0]);
+        let rule = &pkg.children.unwrap()[0];
+        assert!(matches!(rule, RuleOrProperty::Rule(_)));
+        if let RuleOrProperty::Rule(rule) = rule {
+            assert!(matches!(rule.condition, Condition::Fact(_, Some(_))));
+            if let Condition::Fact(ident, args) = &rule.condition {
+                assert_name(&p.lexer.interner, "simple", ident);
+                if let Some(args) = args {
+                    assert_str(&p.lexer.interner, "arg0", args[0]);
+                }
             }
+            assert!(matches!(rule.children, None));
         }
-        assert!(matches!(rule.children, None));
-        assert!(matches!(rule.properties, None));
     }
 
     #[test]
     fn multiple_args() {
         let mut p = Parser::new(Cursor::new(
             r#"
-            pkg hello.world;
+            pkg hello.world
             
             simple[arg0, "arg1", 12345] {}
             "#,
@@ -934,17 +1157,36 @@ mod tests {
         let pkg = executor::block_on(p.parse()).unwrap();
         assert_name(&p.lexer.interner, "hello.world", &pkg.name);
 
-        let rule = &pkg.rules.unwrap()[0];
-        assert!(matches!(rule.condition, Condition::Fact(_, Some(_))));
-        if let Condition::Fact(ident, args) = &rule.condition {
-            assert_name(&p.lexer.interner, "simple", ident);
-            if let Some(args) = args {
-                assert_str(&p.lexer.interner, "arg0", args[0]);
-                assert_str(&p.lexer.interner, "arg1", args[1]);
-                assert_str(&p.lexer.interner, "12345", args[2]);
+        let rule = &pkg.children.unwrap()[0];
+        assert!(matches!(rule, RuleOrProperty::Rule(_)));
+        if let RuleOrProperty::Rule(rule) = rule {
+            assert!(matches!(rule.condition, Condition::Fact(_, Some(_))));
+            if let Condition::Fact(ident, args) = &rule.condition {
+                assert_name(&p.lexer.interner, "simple", ident);
+                if let Some(args) = args {
+                    assert_str(&p.lexer.interner, "arg0", args[0]);
+                    assert_str(&p.lexer.interner, "arg1", args[1]);
+                    assert_str(&p.lexer.interner, "12345", args[2]);
+                }
             }
+            assert!(matches!(rule.children, None));
         }
-        assert!(matches!(rule.children, None));
-        assert!(matches!(rule.properties, None));
+    }
+
+    #[test]
+    fn accepts1() {
+        let mut p = Parser::new(Cursor::new(
+            r#"
+            # Is it the weekend?
+            pkg test.package
+            
+            weekend: false
+            
+            saturday, sunday {
+                weekend: true
+            }
+            "#,
+        ));
+        assert!(matches!(executor::block_on(p.parse()), Ok(_)));
     }
 }

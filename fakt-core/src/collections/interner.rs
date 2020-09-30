@@ -84,6 +84,11 @@ where
             .map(|&slice| T::from_bytes(slice))
     }
 
+    #[inline]
+    pub fn eq(&self, expected: &T, interned: Interned<T>) -> Option<bool> {
+        self.get(interned).map(|s| expected == s)
+    }
+
     // Safety: We preserve pointer validity by chaining buffers together
     //   rather than re-allocating them
     unsafe fn buffer(&mut self, value: &T) -> (&'static [u8], &'static T) {
