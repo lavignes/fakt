@@ -10,6 +10,8 @@ pub struct Interned<T: ?Sized> {
     marker: PhantomData<T>,
 }
 
+impl<T: ?Sized> Copy for Interned<T> {}
+
 impl<T: ?Sized> Clone for Interned<T> {
     fn clone(&self) -> Interned<T> {
         Interned {
@@ -76,7 +78,7 @@ where
     }
 
     #[inline]
-    pub fn get(&self, interned: &Interned<T>) -> Option<&T> {
+    pub fn get(&self, interned: Interned<T>) -> Option<&T> {
         self.slices
             .get(interned.slice_id)
             .map(|&slice| T::from_bytes(slice))
@@ -139,24 +141,24 @@ mod tests {
         let mut int = Interner::new();
         let hello = int.intern("hello");
 
-        assert_eq!("hello", int.get(&hello).unwrap());
+        assert_eq!("hello", int.get(hello).unwrap());
 
         let shoes = int.intern("shoes");
 
-        assert_eq!("hello", int.get(&hello).unwrap());
-        assert_eq!("shoes", int.get(&shoes).unwrap());
+        assert_eq!("hello", int.get(hello).unwrap());
+        assert_eq!("shoes", int.get(shoes).unwrap());
 
         let socks = int.intern("socks");
 
-        assert_eq!("hello", int.get(&hello).unwrap());
-        assert_eq!("shoes", int.get(&shoes).unwrap());
-        assert_eq!("socks", int.get(&socks).unwrap());
+        assert_eq!("hello", int.get(hello).unwrap());
+        assert_eq!("shoes", int.get(shoes).unwrap());
+        assert_eq!("socks", int.get(socks).unwrap());
 
         let shirts = int.intern("shirts");
 
-        assert_eq!("hello", int.get(&hello).unwrap());
-        assert_eq!("shoes", int.get(&shoes).unwrap());
-        assert_eq!("socks", int.get(&socks).unwrap());
-        assert_eq!("shirts", int.get(&shirts).unwrap());
+        assert_eq!("hello", int.get(hello).unwrap());
+        assert_eq!("shoes", int.get(shoes).unwrap());
+        assert_eq!("socks", int.get(socks).unwrap());
+        assert_eq!("shirts", int.get(shirts).unwrap());
     }
 }

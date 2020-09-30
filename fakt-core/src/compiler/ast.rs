@@ -1,8 +1,9 @@
+use crate::collections::Interned;
 use std::collections::HashMap;
 
 #[derive(Debug)]
 pub enum Condition {
-    Fact(String, Option<Vec<String>>),
+    Fact(Name, Option<Vec<Interned<str>>>),
     And(Box<Condition>, Box<Condition>),
     Or(Box<Condition>, Box<Condition>),
     Xor(Box<Condition>, Box<Condition>),
@@ -12,14 +13,14 @@ pub enum Condition {
 #[derive(Debug)]
 pub enum PropertyValue {
     Bool(bool),
-    String(String),
-    Array(Vec<String>),
-    Map(HashMap<String, PropertyValue>),
+    String(Interned<str>),
+    Array(Vec<Interned<str>>),
+    Map(HashMap<Interned<str>, PropertyValue>),
 }
 
 #[derive(Debug)]
 pub struct Property {
-    pub(crate) name: String,
+    pub(crate) name: Name,
     pub(crate) value: Option<PropertyValue>,
 }
 
@@ -32,6 +33,11 @@ pub struct Rule {
 
 #[derive(Debug)]
 pub struct Package {
-    pub(crate) name: String,
+    pub(crate) name: Name,
     pub(crate) rules: Option<Vec<Rule>>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct Name {
+    pub(crate) parts: Vec<Interned<str>>,
 }

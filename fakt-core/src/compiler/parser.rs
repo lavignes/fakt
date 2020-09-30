@@ -1,7 +1,7 @@
 use crate::{
-    collections::Interner,
+    collections::{Interned, Interner},
     compiler::{
-        ast::{Condition, Package, Rule},
+        ast::{Condition, Name, Package, Rule},
         lexer::{self, Lexer, Location, Token},
     },
 };
@@ -80,9 +80,9 @@ impl<R: AsyncRead + Unpin> Parser<R> {
         Ok(Package { name, rules })
     }
 
-    async fn package_name(&mut self) -> Result<String, Error> {
+    async fn package_name(&mut self) -> Result<Name, Error> {
         self.expect_simple_token(Token::Pkg).await?;
-        let (_, name) = self.expect_qualified_identifier().await?;
+        let (_, name) = self.expect_name().await?;
         self.expect_simple_token(Token::Semi).await?;
         Ok(name)
     }
@@ -284,9 +284,15 @@ impl<R: AsyncRead + Unpin> Parser<R> {
                 Ok(cond)
             }
             Token::Identifier(_) => {
-                let (_, ident) = self.expect_qualified_identifier().await?;
-                // TODO: args
-                Ok(Condition::Fact(ident, None))
+                let (_, name) = self.expect_name().await?;
+                let args = match self.args_opt().await {
+                    Some(Ok(rules)) => Some(rules),
+                    Some(Err(err)) => {
+                        return Err(err);
+                    }
+                    None => None,
+                };
+                Ok(Condition::Fact(name, args))
             }
             other => Err(Error::SyntaxError(
                 self.lexer.location,
@@ -310,29 +316,67 @@ impl<R: AsyncRead + Unpin> Parser<R> {
         }
     }
 
-    async fn expect_qualified_identifier(&mut self) -> Result<(Location, String), Error> {
-        let mut s = String::new();
+    async fn args_opt(&mut self) -> Option<Result<Vec<Interned<str>>, Error>> {
+        match self.expect_simple_token_opt(Token::BracketOpen).await {
+            Some(Err(err)) => return Some(Err(err)),
+            Some(Ok(_)) => {}
+            None => {
+                return None;
+            }
+        }
+
+        let mut args = Vec::new();
+        loop {
+            match self.expect_string().await {
+                Ok((_, s)) => {
+                    let s = s;
+                    args.push(s)
+                }
+                Err(err) => {
+                    return Some(Err(err));
+                }
+            }
+
+            match self.expect_simple_token_opt(Token::Comma).await {
+                Some(Err(err)) => return Some(Err(err)),
+                Some(Ok(_)) => {}
+                None => {
+                    break;
+                }
+            }
+        }
+
+        if let Err(err) = self.expect_simple_token(Token::BracketClose).await {
+            return Some(Err(err));
+        }
+
+        if args.is_empty() {
+            None
+        } else {
+            Some(Ok(args))
+        }
+    }
+
+    async fn expect_name(&mut self) -> Result<(Location, Name), Error> {
+        let mut parts = Vec::new();
         let location = self.lexer.location;
         loop {
             let (_, tok) = self.expect_identifier().await?;
             if let Token::Identifier(ident) = tok {
-                s.push_str(self.lexer.interner.get(&ident).unwrap());
+                parts.push(ident);
             }
             if let Some(result) = self.expect_simple_token_opt(Token::Dot).await {
                 result?;
-                s.push('.');
                 continue;
             } else {
-                return Ok((location, s));
+                return Ok((location, Name { parts }));
             }
         }
     }
 
-    async fn expect_qualified_identifier_opt(
-        &mut self,
-    ) -> Option<Result<(Location, String), Error>> {
+    async fn expect_qualified_identifier_opt(&mut self) -> Option<Result<(Location, Name), Error>> {
         if let Some(Ok((_, Token::Identifier(_)))) = self.peek().await {
-            Some(self.expect_qualified_identifier().await)
+            Some(self.expect_name().await)
         } else {
             None
         }
@@ -396,6 +440,24 @@ impl<R: AsyncRead + Unpin> Parser<R> {
         }
     }
 
+    async fn expect_string(&mut self) -> Result<(Location, Interned<str>), Error> {
+        match self.next().await {
+            Some(Ok((location, tok))) => match tok {
+                Token::String(s) => Ok((location, s)),
+                Token::Identifier(s) => Ok((location, s)),
+                _ => Err(Error::SyntaxError(
+                    location,
+                    format!("unexpected {}, expected a string", tok),
+                )),
+            },
+            Some(Err(err)) => Err(err),
+            None => Err(Error::SyntaxError(
+                self.lexer.location,
+                "unexpected end of input, expected a string".into(),
+            )),
+        }
+    }
+
     /// Peek the next token
     async fn peek(&mut self) -> Option<Result<(Location, Token), Error>> {
         match self.next().await? {
@@ -424,6 +486,7 @@ impl<R: AsyncRead + Unpin> Parser<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::collections::Interned;
     use futures::{executor, io::Cursor};
 
     fn assert_syntax_err(result: Result<Package, Error>, location: (usize, usize), msg: &str) {
@@ -432,6 +495,16 @@ mod tests {
             assert_eq!(location.0, loc.line);
             assert_eq!(location.1, loc.column);
             assert_eq!(msg, m);
+        }
+    }
+
+    fn assert_str(interner: &Interner<str>, s: &str, interned: Interned<str>) {
+        assert_eq!(Some(s), interner.get(interned));
+    }
+
+    fn assert_name(interner: &Interner<str>, s: &str, name: &Name) {
+        for (expected, actual) in s.split(".").zip(name.parts.iter()) {
+            assert_str(interner, expected, *actual);
         }
     }
 
@@ -464,7 +537,7 @@ mod tests {
     fn empty_package() {
         let mut p = Parser::new(Cursor::new("pkg hello.world;"));
         let pkg = executor::block_on(p.parse()).unwrap();
-        assert_eq!("hello.world", pkg.name);
+        assert_name(&p.lexer.interner, "hello.world", &pkg.name);
     }
 
     #[test]
@@ -477,12 +550,12 @@ mod tests {
             "#,
         ));
         let pkg = executor::block_on(p.parse()).unwrap();
-        assert_eq!("hello.world", pkg.name);
+        assert_name(&p.lexer.interner, "hello.world", &pkg.name);
 
         let rule = &pkg.rules.unwrap()[0];
         assert!(matches!(rule.condition, Condition::Fact(_, None)));
         if let Condition::Fact(ident, _) = &rule.condition {
-            assert_eq!("simple", ident);
+            assert_name(&p.lexer.interner, "simple", ident);
         }
         assert!(matches!(rule.children, None));
         assert!(matches!(rule.properties, None));
@@ -498,12 +571,12 @@ mod tests {
             "#,
         ));
         let pkg = executor::block_on(p.parse()).unwrap();
-        assert_eq!("hello.world", pkg.name);
+        assert_name(&p.lexer.interner, "hello.world", &pkg.name);
 
         let rule = &pkg.rules.unwrap()[0];
         assert!(matches!(rule.condition, Condition::Fact(_, None)));
         if let Condition::Fact(ident, _) = &rule.condition {
-            assert_eq!("level1", ident);
+            assert_name(&p.lexer.interner, "level1", ident);
         }
         assert!(matches!(rule.children, Some(_)));
         assert!(matches!(rule.properties, None));
@@ -512,7 +585,7 @@ mod tests {
             let rule = &children[0];
             assert!(matches!(rule.condition, Condition::Fact(_, None)));
             if let Condition::Fact(ident, _) = &rule.condition {
-                assert_eq!("level2", ident);
+                assert_name(&p.lexer.interner, "level2", ident);
             }
             assert!(matches!(rule.children, None));
             assert!(matches!(rule.properties, None));
@@ -529,18 +602,18 @@ mod tests {
             "#,
         ));
         let pkg = executor::block_on(p.parse()).unwrap();
-        assert_eq!("hello.world", pkg.name);
+        assert_name(&p.lexer.interner, "hello.world", &pkg.name);
 
         let rule = &pkg.rules.unwrap()[0];
         assert!(matches!(rule.condition, Condition::And(_, _)));
         if let Condition::And(lhs, rhs) = &rule.condition {
             assert!(matches!(**lhs, Condition::Fact(_, None)));
             if let Condition::Fact(ident, _) = &**lhs {
-                assert_eq!("lhs", ident);
+                assert_name(&p.lexer.interner, "lhs", ident);
             }
             assert!(matches!(**rhs, Condition::Fact(_, None)));
             if let Condition::Fact(ident, _) = &**rhs {
-                assert_eq!("rhs", ident);
+                assert_name(&p.lexer.interner, "rhs", ident);
             }
         }
     }
@@ -555,18 +628,18 @@ mod tests {
             "#,
         ));
         let pkg = executor::block_on(p.parse()).unwrap();
-        assert_eq!("hello.world", pkg.name);
+        assert_name(&p.lexer.interner, "hello.world", &pkg.name);
 
         let rule = &pkg.rules.unwrap()[0];
         assert!(matches!(rule.condition, Condition::And(_, _)));
         if let Condition::And(lhs, rhs) = &rule.condition {
             assert!(matches!(**lhs, Condition::Fact(_, None)));
             if let Condition::Fact(ident, _) = &**lhs {
-                assert_eq!("lhs", ident);
+                assert_name(&p.lexer.interner, "lhs", ident);
             }
             assert!(matches!(**rhs, Condition::Fact(_, None)));
             if let Condition::Fact(ident, _) = &**rhs {
-                assert_eq!("rhs", ident);
+                assert_name(&p.lexer.interner, "rhs", ident);
             }
         }
     }
@@ -581,18 +654,18 @@ mod tests {
             "#,
         ));
         let pkg = executor::block_on(p.parse()).unwrap();
-        assert_eq!("hello.world", pkg.name);
+        assert_name(&p.lexer.interner, "hello.world", &pkg.name);
 
         let rule = &pkg.rules.unwrap()[0];
         assert!(matches!(rule.condition, Condition::Or(_, _)));
         if let Condition::Or(lhs, rhs) = &rule.condition {
             assert!(matches!(**lhs, Condition::Fact(_, None)));
             if let Condition::Fact(ident, _) = &**lhs {
-                assert_eq!("lhs", ident);
+                assert_name(&p.lexer.interner, "lhs", ident);
             }
             assert!(matches!(**rhs, Condition::Fact(_, None)));
             if let Condition::Fact(ident, _) = &**rhs {
-                assert_eq!("rhs", ident);
+                assert_name(&p.lexer.interner, "rhs", ident);
             }
         }
     }
@@ -607,18 +680,18 @@ mod tests {
             "#,
         ));
         let pkg = executor::block_on(p.parse()).unwrap();
-        assert_eq!("hello.world", pkg.name);
+        assert_name(&p.lexer.interner, "hello.world", &pkg.name);
 
         let rule = &pkg.rules.unwrap()[0];
         assert!(matches!(rule.condition, Condition::Or(_, _)));
         if let Condition::Or(lhs, rhs) = &rule.condition {
             assert!(matches!(**lhs, Condition::Fact(_, None)));
             if let Condition::Fact(ident, _) = &**lhs {
-                assert_eq!("lhs", ident);
+                assert_name(&p.lexer.interner, "lhs", ident);
             }
             assert!(matches!(**rhs, Condition::Fact(_, None)));
             if let Condition::Fact(ident, _) = &**rhs {
-                assert_eq!("rhs", ident);
+                assert_name(&p.lexer.interner, "rhs", ident);
             }
         }
     }
@@ -633,19 +706,245 @@ mod tests {
             "#,
         ));
         let pkg = executor::block_on(p.parse()).unwrap();
-        assert_eq!("hello.world", pkg.name);
+        assert_name(&p.lexer.interner, "hello.world", &pkg.name);
 
         let rule = &pkg.rules.unwrap()[0];
         assert!(matches!(rule.condition, Condition::Xor(_, _)));
         if let Condition::Xor(lhs, rhs) = &rule.condition {
             assert!(matches!(**lhs, Condition::Fact(_, None)));
             if let Condition::Fact(ident, _) = &**lhs {
-                assert_eq!("lhs", ident);
+                assert_name(&p.lexer.interner, "lhs", ident);
             }
             assert!(matches!(**rhs, Condition::Fact(_, None)));
             if let Condition::Fact(ident, _) = &**rhs {
-                assert_eq!("rhs", ident);
+                assert_name(&p.lexer.interner, "rhs", ident);
             }
         }
+    }
+
+    #[test]
+    fn not() {
+        let mut p = Parser::new(Cursor::new(
+            r#"
+            pkg hello.world;
+            
+            not simple {} 
+            "#,
+        ));
+        let pkg = executor::block_on(p.parse()).unwrap();
+        assert_name(&p.lexer.interner, "hello.world", &pkg.name);
+
+        let rule = &pkg.rules.unwrap()[0];
+        assert!(matches!(rule.condition, Condition::Not(_)));
+        if let Condition::Not(rule) = &rule.condition {
+            assert!(matches!(**rule, Condition::Fact(_, None)));
+            if let Condition::Fact(ident, _) = &**rule {
+                assert_name(&p.lexer.interner, "simple", ident);
+            }
+        }
+    }
+
+    #[test]
+    fn parens() {
+        let mut p = Parser::new(Cursor::new(
+            r#"
+            pkg hello.world;
+            
+            (lhs rhs) {} 
+            "#,
+        ));
+        let pkg = executor::block_on(p.parse()).unwrap();
+        assert_name(&p.lexer.interner, "hello.world", &pkg.name);
+
+        let rule = &pkg.rules.unwrap()[0];
+        assert!(matches!(rule.condition, Condition::And(_, _)));
+        if let Condition::And(lhs, rhs) = &rule.condition {
+            assert!(matches!(**lhs, Condition::Fact(_, None)));
+            if let Condition::Fact(ident, _) = &**lhs {
+                assert_name(&p.lexer.interner, "lhs", ident);
+            }
+            assert!(matches!(**rhs, Condition::Fact(_, None)));
+            if let Condition::Fact(ident, _) = &**rhs {
+                assert_name(&p.lexer.interner, "rhs", ident);
+            }
+        }
+    }
+
+    #[test]
+    fn precendence1() {
+        let mut p = Parser::new(Cursor::new(
+            r#"
+            pkg hello.world;
+            
+            one or two and three {} 
+            "#,
+        ));
+        let pkg = executor::block_on(p.parse()).unwrap();
+        assert_name(&p.lexer.interner, "hello.world", &pkg.name);
+
+        let rule = &pkg.rules.unwrap()[0];
+        assert!(matches!(rule.condition, Condition::Or(_, _)));
+        if let Condition::Or(lhs, rhs) = &rule.condition {
+            assert!(matches!(**lhs, Condition::Fact(_, None)));
+            if let Condition::Fact(ident, _) = &**lhs {
+                assert_name(&p.lexer.interner, "one", ident);
+            }
+            assert!(matches!(**rhs, Condition::And(_, _)));
+            if let Condition::And(lhs, rhs) = &**rhs {
+                assert!(matches!(**lhs, Condition::Fact(_, None)));
+                if let Condition::Fact(ident, _) = &**lhs {
+                    assert_name(&p.lexer.interner, "two", ident);
+                }
+                assert!(matches!(**rhs, Condition::Fact(_, None)));
+                if let Condition::Fact(ident, _) = &**rhs {
+                    assert_name(&p.lexer.interner, "three", ident);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn precendence2() {
+        let mut p = Parser::new(Cursor::new(
+            r#"
+            pkg hello.world;
+            
+            one or two xor three {} 
+            "#,
+        ));
+        let pkg = executor::block_on(p.parse()).unwrap();
+        assert_name(&p.lexer.interner, "hello.world", &pkg.name);
+
+        let rule = &pkg.rules.unwrap()[0];
+        assert!(matches!(rule.condition, Condition::Or(_, _)));
+        if let Condition::Or(lhs, rhs) = &rule.condition {
+            assert!(matches!(**lhs, Condition::Fact(_, None)));
+            if let Condition::Fact(ident, _) = &**lhs {
+                assert_name(&p.lexer.interner, "one", ident);
+            }
+            assert!(matches!(**rhs, Condition::Xor(_, _)));
+            if let Condition::Xor(lhs, rhs) = &**rhs {
+                assert!(matches!(**lhs, Condition::Fact(_, None)));
+                if let Condition::Fact(ident, _) = &**lhs {
+                    assert_name(&p.lexer.interner, "two", ident);
+                }
+                assert!(matches!(**rhs, Condition::Fact(_, None)));
+                if let Condition::Fact(ident, _) = &**rhs {
+                    assert_name(&p.lexer.interner, "three", ident);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn precendence3() {
+        let mut p = Parser::new(Cursor::new(
+            r#"
+            pkg hello.world;
+            
+            not lhs or rhs {} 
+            "#,
+        ));
+        let pkg = executor::block_on(p.parse()).unwrap();
+        assert_name(&p.lexer.interner, "hello.world", &pkg.name);
+
+        let rule = &pkg.rules.unwrap()[0];
+        assert!(matches!(rule.condition, Condition::Or(_, _)));
+        if let Condition::Or(lhs, rhs) = &rule.condition {
+            assert!(matches!(**lhs, Condition::Not(_)));
+            if let Condition::Not(rule) = &**lhs {
+                assert!(matches!(**rule, Condition::Fact(_, None)));
+                if let Condition::Fact(ident, _) = &**rule {
+                    assert_name(&p.lexer.interner, "lhs", ident);
+                }
+            }
+            assert!(matches!(**rhs, Condition::Fact(_, None)));
+            if let Condition::Fact(ident, _) = &**rhs {
+                assert_name(&p.lexer.interner, "rhs", ident);
+            }
+        }
+    }
+
+    #[test]
+    fn precendence_parens() {
+        let mut p = Parser::new(Cursor::new(
+            r#"
+            pkg hello.world;
+            
+            (one or two) xor three {} 
+            "#,
+        ));
+        let pkg = executor::block_on(p.parse()).unwrap();
+        assert_name(&p.lexer.interner, "hello.world", &pkg.name);
+
+        let rule = &pkg.rules.unwrap()[0];
+        assert!(matches!(rule.condition, Condition::Xor(_, _)));
+        if let Condition::Xor(lhs, rhs) = &rule.condition {
+            assert!(matches!(**lhs, Condition::Or(_, _)));
+            if let Condition::Or(lhs, rhs) = &**lhs {
+                assert!(matches!(**lhs, Condition::Fact(_, None)));
+                if let Condition::Fact(ident, _) = &**lhs {
+                    assert_name(&p.lexer.interner, "one", ident);
+                }
+                assert!(matches!(**rhs, Condition::Fact(_, None)));
+                if let Condition::Fact(ident, _) = &**rhs {
+                    assert_name(&p.lexer.interner, "two", ident);
+                }
+            }
+            assert!(matches!(**rhs, Condition::Fact(_, None)));
+            if let Condition::Fact(ident, _) = &**rhs {
+                assert_name(&p.lexer.interner, "three", ident);
+            }
+        }
+    }
+
+    #[test]
+    fn one_arg() {
+        let mut p = Parser::new(Cursor::new(
+            r#"
+            pkg hello.world;
+            
+            simple[arg0] {}
+            "#,
+        ));
+        let pkg = executor::block_on(p.parse()).unwrap();
+        assert_name(&p.lexer.interner, "hello.world", &pkg.name);
+
+        let rule = &pkg.rules.unwrap()[0];
+        assert!(matches!(rule.condition, Condition::Fact(_, Some(_))));
+        if let Condition::Fact(ident, args) = &rule.condition {
+            assert_name(&p.lexer.interner, "simple", ident);
+            if let Some(args) = args {
+                assert_str(&p.lexer.interner, "arg0", args[0]);
+            }
+        }
+        assert!(matches!(rule.children, None));
+        assert!(matches!(rule.properties, None));
+    }
+
+    #[test]
+    fn multiple_args() {
+        let mut p = Parser::new(Cursor::new(
+            r#"
+            pkg hello.world;
+            
+            simple[arg0, "arg1", 12345] {}
+            "#,
+        ));
+        let pkg = executor::block_on(p.parse()).unwrap();
+        assert_name(&p.lexer.interner, "hello.world", &pkg.name);
+
+        let rule = &pkg.rules.unwrap()[0];
+        assert!(matches!(rule.condition, Condition::Fact(_, Some(_))));
+        if let Condition::Fact(ident, args) = &rule.condition {
+            assert_name(&p.lexer.interner, "simple", ident);
+            if let Some(args) = args {
+                assert_str(&p.lexer.interner, "arg0", args[0]);
+                assert_str(&p.lexer.interner, "arg1", args[1]);
+                assert_str(&p.lexer.interner, "12345", args[2]);
+            }
+        }
+        assert!(matches!(rule.children, None));
+        assert!(matches!(rule.properties, None));
     }
 }
