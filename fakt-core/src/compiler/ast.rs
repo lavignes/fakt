@@ -33,5 +33,5 @@ pub struct Rule {
 #[derive(Debug)]
 pub struct Package {
     pub(crate) name: String,
-    pub(crate) rules: Vec<Rule>,
+    pub(crate) rules: Option<Vec<Rule>>,
 }

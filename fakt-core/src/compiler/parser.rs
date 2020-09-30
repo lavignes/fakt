@@ -70,10 +70,14 @@ impl<R: AsyncRead + Unpin> Parser<R> {
 
     pub async fn parse(&mut self) -> Result<Package, Error> {
         let name = self.package_name().await?;
-        Ok(Package {
-            name,
-            rules: self.rules().await?,
-        })
+        let rules = match self.rules_opt().await {
+            Some(Err(err)) => {
+                return Err(err);
+            }
+            Some(Ok(ok)) => Some(ok),
+            None => None,
+        };
+        Ok(Package { name, rules })
     }
 
     async fn package_name(&mut self) -> Result<String, Error> {
@@ -105,7 +109,13 @@ impl<R: AsyncRead + Unpin> Parser<R> {
                 }
             }
         }
-        Some(Ok(rules))
+        // There is actually no allocation for an empty vec
+        //   but we signal intent here.
+        if rules.is_empty() {
+            None
+        } else {
+            Some(Ok(rules))
+        }
     }
 
     async fn rule_opt(&mut self) -> Option<Result<Rule, Error>> {
@@ -136,27 +146,143 @@ impl<R: AsyncRead + Unpin> Parser<R> {
 
     #[async_recursion::async_recursion(?Send)]
     async fn condition(&mut self) -> Result<Condition, Error> {
-        let (_, tok) = match self.next().await {
-            Some(Ok((location, tok))) => (location, tok),
+        let (_, tok) = match self.peek().await {
+            Some(Ok(ok)) => ok,
             Some(Err(err)) => {
                 return Err(err);
             }
             None => {
-                return {
-                    Err(Error::SyntaxError(
-                        self.lexer.location,
-                        "unexpected end of input, expected a rule condition".into(),
-                    ))
-                };
+                return Err(Error::SyntaxError(
+                    self.lexer.location,
+                    "unexpected end of input, expected a rule condition".into(),
+                ));
             }
         };
         match tok {
+            Token::ParenOpen | Token::Identifier(_) | Token::Not | Token::Bang => {
+                self.condition_lowest().await
+            }
+            other => Err(Error::SyntaxError(
+                self.lexer.location,
+                format!("unexpected {}, expected a rule condition", other),
+            )),
+        }
+    }
+
+    async fn condition_lowest(&mut self) -> Result<Condition, Error> {
+        let low = self.condition_low().await?;
+
+        let (_, tok) = match self.peek().await {
+            Some(Ok(ok)) => ok,
+            Some(Err(err)) => {
+                return Err(err);
+            }
+            None => {
+                return Err(Error::SyntaxError(
+                    self.lexer.location,
+                    "unexpected end of input, expected a rule operator or rule body".into(),
+                ));
+            }
+        };
+
+        match tok {
+            Token::Or | Token::Comma => {
+                self.next().await;
+                Ok(Condition::Or(
+                    Box::new(low),
+                    Box::new(self.condition_low().await?),
+                ))
+            }
+            _ => Ok(low),
+        }
+    }
+
+    async fn condition_low(&mut self) -> Result<Condition, Error> {
+        let low = self.condition_high().await?;
+
+        let (_, tok) = match self.peek().await {
+            Some(Ok(ok)) => ok,
+            Some(Err(err)) => {
+                return Err(err);
+            }
+            None => {
+                return Err(Error::SyntaxError(
+                    self.lexer.location,
+                    "unexpected end of input, expected a rule operator or rule body".into(),
+                ));
+            }
+        };
+
+        match tok {
+            Token::Xor => {
+                self.next().await;
+                Ok(Condition::Xor(
+                    Box::new(low),
+                    Box::new(self.condition_high().await?),
+                ))
+            }
+            _ => Ok(low),
+        }
+    }
+
+    async fn condition_high(&mut self) -> Result<Condition, Error> {
+        let high = self.condition_highest().await?;
+
+        let (_, tok) = match self.peek().await {
+            Some(Ok(ok)) => ok,
+            Some(Err(err)) => {
+                return Err(err);
+            }
+            None => {
+                return Err(Error::SyntaxError(
+                    self.lexer.location,
+                    "unexpected end of input, expected a rule operator or rule body".into(),
+                ));
+            }
+        };
+
+        match tok {
+            Token::And | Token::Identifier(_) | Token::ParenOpen | Token::Bang | Token::Not => {
+                // Since the and operator is implied, we dont want to accidentally consume
+                //   the other tokens that can be the RHS of the and condition
+                if let Token::And = tok {
+                    self.next().await;
+                }
+                Ok(Condition::And(
+                    Box::new(high),
+                    Box::new(self.condition().await?),
+                ))
+            }
+            _ => Ok(high),
+        }
+    }
+
+    #[async_recursion::async_recursion(?Send)]
+    async fn condition_highest(&mut self) -> Result<Condition, Error> {
+        let (_, tok) = match self.peek().await {
+            Some(Ok(ok)) => ok,
+            Some(Err(err)) => {
+                return Err(err);
+            }
+            None => {
+                return Err(Error::SyntaxError(
+                    self.lexer.location,
+                    "unexpected end of input, expected a rule operator or rule body".into(),
+                ));
+            }
+        };
+
+        match tok {
+            Token::Bang | Token::Not => {
+                self.next().await;
+                Ok(Condition::Not(Box::new(self.condition_highest().await?)))
+            }
             Token::ParenOpen => {
+                self.next().await;
                 let cond = self.condition().await?;
                 self.expect_simple_token(Token::ParenClose).await?;
                 Ok(cond)
             }
-            Token::Not | Token::Bang => Ok(Condition::Not(Box::new(self.condition().await?))),
             Token::Identifier(_) => {
                 let (_, ident) = self.expect_qualified_identifier().await?;
                 // TODO: args
@@ -170,15 +296,14 @@ impl<R: AsyncRead + Unpin> Parser<R> {
     }
 
     async fn condition_opt(&mut self) -> Option<Result<Condition, Error>> {
-        let (location, tok) = match self.next().await? {
-            Ok((location, tok)) => (location, tok),
+        let (_, tok) = match self.peek().await? {
+            Ok(ok) => ok,
             Err(err) => {
                 return Some(Err(err));
             }
         };
         match tok {
             Token::ParenOpen | Token::Not | Token::Bang | Token::Identifier(_) => {
-                self.stash = Some((location, tok));
                 Some(self.condition().await)
             }
             _ => None,
@@ -206,8 +331,7 @@ impl<R: AsyncRead + Unpin> Parser<R> {
     async fn expect_qualified_identifier_opt(
         &mut self,
     ) -> Option<Result<(Location, String), Error>> {
-        if let Ok((location, tok)) = self.expect_identifier_opt().await? {
-            self.stash = Some((location, tok));
+        if let Some(Ok((_, Token::Identifier(_)))) = self.peek().await {
             Some(self.expect_qualified_identifier().await)
         } else {
             None
@@ -234,6 +358,7 @@ impl<R: AsyncRead + Unpin> Parser<R> {
         }
     }
 
+    /// Peeks the next token and consumes it if it matches the given token
     async fn expect_simple_token_opt(
         &mut self,
         token: Token,
@@ -271,20 +396,18 @@ impl<R: AsyncRead + Unpin> Parser<R> {
         }
     }
 
-    async fn expect_identifier_opt(&mut self) -> Option<Result<(Location, Token), Error>> {
-        match self.next().await {
-            Some(Ok((location, tok))) => {
-                if let Token::Identifier(_) = tok {
-                    Some(Ok((location, tok)))
-                } else {
-                    self.stash = Some((location, tok));
-                    None
-                }
+    /// Peek the next token
+    async fn peek(&mut self) -> Option<Result<(Location, Token), Error>> {
+        match self.next().await? {
+            Ok((location, tok)) => {
+                self.stash = Some((location, tok.clone()));
+                Some(Ok((location, tok)))
             }
-            other => other,
+            Err(err) => Some(Err(err)),
         }
     }
 
+    /// Consume the next token
     async fn next(&mut self) -> Option<Result<(Location, Token), Error>> {
         // Check if we stashed something first before trying to read another token
         if let Some(stash) = self.stash.take() {
@@ -349,18 +472,180 @@ mod tests {
         let mut p = Parser::new(Cursor::new(
             r#"
             pkg hello.world;
+            
             simple {}
             "#,
         ));
         let pkg = executor::block_on(p.parse()).unwrap();
         assert_eq!("hello.world", pkg.name);
 
-        let rule = &pkg.rules[0];
+        let rule = &pkg.rules.unwrap()[0];
         assert!(matches!(rule.condition, Condition::Fact(_, None)));
         if let Condition::Fact(ident, _) = &rule.condition {
             assert_eq!("simple", ident);
         }
         assert!(matches!(rule.children, None));
         assert!(matches!(rule.properties, None));
+    }
+
+    #[test]
+    fn recursive_rule() {
+        let mut p = Parser::new(Cursor::new(
+            r#"
+            pkg hello.world;
+            
+            level1 { level2 {} }
+            "#,
+        ));
+        let pkg = executor::block_on(p.parse()).unwrap();
+        assert_eq!("hello.world", pkg.name);
+
+        let rule = &pkg.rules.unwrap()[0];
+        assert!(matches!(rule.condition, Condition::Fact(_, None)));
+        if let Condition::Fact(ident, _) = &rule.condition {
+            assert_eq!("level1", ident);
+        }
+        assert!(matches!(rule.children, Some(_)));
+        assert!(matches!(rule.properties, None));
+
+        if let Some(children) = &rule.children {
+            let rule = &children[0];
+            assert!(matches!(rule.condition, Condition::Fact(_, None)));
+            if let Condition::Fact(ident, _) = &rule.condition {
+                assert_eq!("level2", ident);
+            }
+            assert!(matches!(rule.children, None));
+            assert!(matches!(rule.properties, None));
+        }
+    }
+
+    #[test]
+    fn explicit_and() {
+        let mut p = Parser::new(Cursor::new(
+            r#"
+            pkg hello.world;
+            
+            lhs and rhs {} 
+            "#,
+        ));
+        let pkg = executor::block_on(p.parse()).unwrap();
+        assert_eq!("hello.world", pkg.name);
+
+        let rule = &pkg.rules.unwrap()[0];
+        assert!(matches!(rule.condition, Condition::And(_, _)));
+        if let Condition::And(lhs, rhs) = &rule.condition {
+            assert!(matches!(**lhs, Condition::Fact(_, None)));
+            if let Condition::Fact(ident, _) = &**lhs {
+                assert_eq!("lhs", ident);
+            }
+            assert!(matches!(**rhs, Condition::Fact(_, None)));
+            if let Condition::Fact(ident, _) = &**rhs {
+                assert_eq!("rhs", ident);
+            }
+        }
+    }
+
+    #[test]
+    fn implicit_and() {
+        let mut p = Parser::new(Cursor::new(
+            r#"
+            pkg hello.world;
+            
+            lhs rhs {} 
+            "#,
+        ));
+        let pkg = executor::block_on(p.parse()).unwrap();
+        assert_eq!("hello.world", pkg.name);
+
+        let rule = &pkg.rules.unwrap()[0];
+        assert!(matches!(rule.condition, Condition::And(_, _)));
+        if let Condition::And(lhs, rhs) = &rule.condition {
+            assert!(matches!(**lhs, Condition::Fact(_, None)));
+            if let Condition::Fact(ident, _) = &**lhs {
+                assert_eq!("lhs", ident);
+            }
+            assert!(matches!(**rhs, Condition::Fact(_, None)));
+            if let Condition::Fact(ident, _) = &**rhs {
+                assert_eq!("rhs", ident);
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_or() {
+        let mut p = Parser::new(Cursor::new(
+            r#"
+            pkg hello.world;
+            
+            lhs or rhs {} 
+            "#,
+        ));
+        let pkg = executor::block_on(p.parse()).unwrap();
+        assert_eq!("hello.world", pkg.name);
+
+        let rule = &pkg.rules.unwrap()[0];
+        assert!(matches!(rule.condition, Condition::Or(_, _)));
+        if let Condition::Or(lhs, rhs) = &rule.condition {
+            assert!(matches!(**lhs, Condition::Fact(_, None)));
+            if let Condition::Fact(ident, _) = &**lhs {
+                assert_eq!("lhs", ident);
+            }
+            assert!(matches!(**rhs, Condition::Fact(_, None)));
+            if let Condition::Fact(ident, _) = &**rhs {
+                assert_eq!("rhs", ident);
+            }
+        }
+    }
+
+    #[test]
+    fn comma_or() {
+        let mut p = Parser::new(Cursor::new(
+            r#"
+            pkg hello.world;
+            
+            lhs, rhs {} 
+            "#,
+        ));
+        let pkg = executor::block_on(p.parse()).unwrap();
+        assert_eq!("hello.world", pkg.name);
+
+        let rule = &pkg.rules.unwrap()[0];
+        assert!(matches!(rule.condition, Condition::Or(_, _)));
+        if let Condition::Or(lhs, rhs) = &rule.condition {
+            assert!(matches!(**lhs, Condition::Fact(_, None)));
+            if let Condition::Fact(ident, _) = &**lhs {
+                assert_eq!("lhs", ident);
+            }
+            assert!(matches!(**rhs, Condition::Fact(_, None)));
+            if let Condition::Fact(ident, _) = &**rhs {
+                assert_eq!("rhs", ident);
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_xor() {
+        let mut p = Parser::new(Cursor::new(
+            r#"
+            pkg hello.world;
+            
+            lhs xor rhs {} 
+            "#,
+        ));
+        let pkg = executor::block_on(p.parse()).unwrap();
+        assert_eq!("hello.world", pkg.name);
+
+        let rule = &pkg.rules.unwrap()[0];
+        assert!(matches!(rule.condition, Condition::Xor(_, _)));
+        if let Condition::Xor(lhs, rhs) = &rule.condition {
+            assert!(matches!(**lhs, Condition::Fact(_, None)));
+            if let Condition::Fact(ident, _) = &**lhs {
+                assert_eq!("lhs", ident);
+            }
+            assert!(matches!(**rhs, Condition::Fact(_, None)));
+            if let Condition::Fact(ident, _) = &**rhs {
+                assert_eq!("rhs", ident);
+            }
+        }
     }
 }

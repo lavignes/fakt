@@ -1,4 +1,4 @@
-use crate::collections::XorHashMap;
+use fxhash::FxHashMap;
 use std::{
     hash::Hash, marker::PhantomData, ops::DerefMut, ptr::slice_from_raw_parts, rc::Rc, str,
     sync::Arc, sync::RwLock,
@@ -10,16 +10,27 @@ pub struct Interned<T: ?Sized> {
     marker: PhantomData<T>,
 }
 
+impl<T: ?Sized> Clone for Interned<T> {
+    fn clone(&self) -> Interned<T> {
+        Interned {
+            slice_id: self.slice_id,
+            marker: PhantomData,
+        }
+    }
+}
+
 pub unsafe trait Internable {
     fn to_bytes(&self) -> &[u8];
     fn from_bytes(bytes: &[u8]) -> &Self;
 }
 
 unsafe impl Internable for str {
+    #[inline]
     fn to_bytes(&self) -> &[u8] {
         self.as_bytes()
     }
 
+    #[inline]
     fn from_bytes(bytes: &[u8]) -> &str {
         unsafe { str::from_utf8_unchecked(bytes) }
     }
@@ -29,7 +40,7 @@ pub struct Interner<T>
 where
     T: Internable + Eq + Hash + ?Sized + 'static,
 {
-    map: XorHashMap<&'static T, usize>,
+    map: FxHashMap<&'static T, usize>,
     slices: Vec<&'static [u8]>,
     buffers: Vec<Vec<u8>>,
 }
@@ -38,9 +49,10 @@ impl<T> Interner<T>
 where
     T: Internable + Eq + Hash + ?Sized,
 {
+    #[inline]
     pub fn new() -> Interner<T> {
         Interner {
-            map: XorHashMap::default(),
+            map: FxHashMap::default(),
             slices: Vec::new(),
             buffers: vec![Vec::with_capacity(32)],
         }
@@ -63,6 +75,7 @@ where
         }
     }
 
+    #[inline]
     pub fn get(&self, interned: &Interned<T>) -> Option<&T> {
         self.slices
             .get(interned.slice_id)
@@ -101,6 +114,7 @@ impl<T> InternerRcWriteExt<T> for Rc<Interner<T>>
 where
     T: Internable + Eq + Hash + ?Sized + 'static,
 {
+    #[inline]
     fn intern(&mut self, value: &T) -> Option<Interned<T>> {
         Rc::get_mut(self).map(|s| s.intern(value))
     }
@@ -110,6 +124,7 @@ impl<T> InternerRcWriteExt<T> for Arc<RwLock<Interner<T>>>
 where
     T: Internable + Eq + Hash + ?Sized + 'static,
 {
+    #[inline]
     fn intern(&mut self, value: &T) -> Option<Interned<T>> {
         Arc::get_mut(self).map(|s| s.write().unwrap().deref_mut().intern(value))
     }

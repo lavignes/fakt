@@ -45,7 +45,7 @@ impl error::Error for Error {
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq, Clone)]
 pub enum Token {
     Comment,
     Pkg,
