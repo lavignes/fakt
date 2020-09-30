@@ -6,47 +6,49 @@ This is the rough EBNF grammar for fakt files:
   line is ignored.
 
 ```ebnf
-<pkg>                  ::= 'pkg' <name> (<rule-or-property>)*
+<pkg>                  ::= "pkg" <name> (<rule-or-property>)*
 
-<name>                 ::= <identifier> ('.' <identifier>)*
+<name>                 ::= <identifier> ("." <identifier>)*
 
-<rule-or-property>     ::= <condition-lowest> '{' (<rule-or-property>)* '}'
+<rule-or-property>     ::= <condition-lowest> "{" (<rule-or-property>)* "}"
                          | <property> 
 
-<condition-lowest>     ::= <condition-low> ',' <condition-low>
-                         | <condition-low> 'or' <condition-low>
+<condition-lowest>     ::= <condition-low> "," <condition-low>
+                         | <condition-low> "or" <condition-low>
 
-<condition-low>        ::= <condition-high> 'xor' <condition-high>
+<condition-low>        ::= <condition-high> "xor" <condition-high>
 
-<condition-high>       ::= <condition-highest> 'and'? <condition-lowest>
+<condition-high>       ::= <condition-highest> "and"? <condition-lowest>
 
-<condition-highest>    ::= '(' <condition-lowest> ')'
-                         | 'not' <condition-highest>
-                         | '!' <condition-highest>
+<condition-highest>    ::= "(" <condition-lowest> ")"
+                         | "not" <condition-highest>
+                         | "!" <condition-highest>
 
-<fact>                 ::= <name> '[' <args> ']'
+<fact>                 ::= <name> "[" <args> "]"
                          | <name>
 
-<args>                 ::= <string> (',' <string>)*
+<args>                 ::= <string> ("," <string>)*
 
-<property>             ::= <name> ':' <value>
+<property>             ::= <name> ":" <value>
 
 <value>                ::= <array>
                          | <map>
                          | <string>
 
-<array>                ::= '[' <value> ']'
-                         | '[' <value> (',' <value>) ']'
+<array>                ::= "[" <value> "]"
+                         | "[" <value> ("," <value>) "]"
 
-<map>                  ::= '{' <string> ':' <value> (',' <string> ':' <value>)* '}'
+<map>                  ::= "{" <string> ":" <value> ("," <string> ":" <value>)* "}"
 
 <string>               ::= <identifier>
                          | <quoted-string>
                          | <double-quoted-string>
                          | <unquoted-string>
 
-; Below are regular expressions:
+```
 
+The regular expressions in the grammar are separated out here:
+```
 <identifier>           ::= /\p{Letter}[\p{Number}]*/
 
 <quoted-string>        ::= /'[^']*'/
