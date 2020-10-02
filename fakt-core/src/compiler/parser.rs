@@ -1,12 +1,12 @@
-use crate::compiler::ast::{Property, PropertyValue, RuleOrProperty};
 use crate::{
     collections::{Interned, Interner},
     compiler::{
-        ast::{Condition, Name, Package, Rule},
+        ast::{Condition, Name, Package, Property, PropertyValue, Rule, RuleOrProperty},
         lexer::{self, Lexer, Location, Token},
     },
 };
 use futures::{AsyncRead, StreamExt};
+use fxhash::FxHashMap;
 use std::{
     error,
     fmt::{self, Display, Formatter},
@@ -342,17 +342,14 @@ impl<R: AsyncRead + Unpin> Parser<R> {
                 };
                 match self.expect_simple_token_opt(Token::Colon).await {
                     Some(Ok(_)) => {
-                        // TODO: Property value other than string
-                        let (_, value) = match self.expect_string().await {
+                        let (_, value) = match self.expect_value().await {
                             Ok(ok) => ok,
                             Err(err) => {
                                 return Some(Err(err));
                             }
                         };
-                        Some(Ok(ConditionOrProperty::Property(Property {
-                            name,
-                            value: PropertyValue::String(value),
-                        })))
+
+                        Some(Ok(ConditionOrProperty::Property(Property { name, value })))
                     }
                     Some(Err(err)) => Some(Err(err)),
                     None => Some(
@@ -380,10 +377,7 @@ impl<R: AsyncRead + Unpin> Parser<R> {
         let mut args = Vec::new();
         loop {
             match self.expect_string().await {
-                Ok((_, s)) => {
-                    let s = s;
-                    args.push(s)
-                }
+                Ok((_, s)) => args.push(s),
                 Err(err) => {
                     return Some(Err(err));
                 }
@@ -462,6 +456,107 @@ impl<R: AsyncRead + Unpin> Parser<R> {
             }
             other => other,
         }
+    }
+
+    #[async_recursion::async_recursion(?Send)]
+    async fn expect_value(&mut self) -> Result<(Location, PropertyValue), Error> {
+        let (_, tok) = match self.peek().await {
+            Some(Ok(ok)) => ok,
+            Some(Err(err)) => {
+                return Err(err);
+            }
+            None => {
+                return Err(Error::SyntaxError(
+                    self.lexer.location,
+                    "unexpected end of input, expected a property value".into(),
+                ));
+            }
+        };
+
+        match tok {
+            Token::String(_) | Token::Identifier(_) => {
+                let (location, s) = self.expect_string().await?;
+                Ok((location, PropertyValue::String(s)))
+            }
+
+            Token::BracketOpen => {
+                let (location, a) = self.expect_array().await?;
+                Ok((location, PropertyValue::Array(a)))
+            }
+
+            Token::BraceOpen => {
+                let (location, m) = self.expect_map().await?;
+                Ok((location, PropertyValue::Map(m)))
+            }
+
+            other => Err(Error::SyntaxError(
+                self.lexer.location,
+                format!("unexpected {}, expected a property value", other),
+            )),
+        }
+    }
+
+    async fn expect_array(&mut self) -> Result<(Location, Vec<PropertyValue>), Error> {
+        let (location, _) = self.expect_simple_token(Token::BracketOpen).await?;
+
+        let mut array = Vec::new();
+        loop {
+            match self.expect_value().await {
+                Ok((_, v)) => array.push(v),
+                Err(err) => {
+                    return Err(err);
+                }
+            }
+
+            match self.expect_simple_token_opt(Token::Comma).await {
+                Some(Err(err)) => return Err(err),
+                Some(Ok(_)) => {}
+                None => {
+                    break;
+                }
+            }
+        }
+
+        self.expect_simple_token(Token::BracketClose).await?;
+        Ok((location, array))
+    }
+
+    async fn expect_map(
+        &mut self,
+    ) -> Result<(Location, FxHashMap<Interned<str>, PropertyValue>), Error> {
+        let (location, _) = self.expect_simple_token(Token::BraceOpen).await?;
+
+        let mut map = FxHashMap::default();
+        loop {
+            let key = match self.expect_string().await {
+                Ok((_, key)) => key,
+                Err(err) => {
+                    return Err(err);
+                }
+            };
+
+            self.expect_simple_token(Token::Colon).await?;
+
+            match self.expect_value().await {
+                Ok((_, v)) => {
+                    map.insert(key, v);
+                }
+                Err(err) => {
+                    return Err(err);
+                }
+            }
+
+            match self.expect_simple_token_opt(Token::Comma).await {
+                Some(Err(err)) => return Err(err),
+                Some(Ok(_)) => {}
+                None => {
+                    break;
+                }
+            }
+        }
+
+        self.expect_simple_token(Token::BraceClose).await?;
+        Ok((location, map))
     }
 
     async fn expect_identifier(&mut self) -> Result<(Location, Token), Error> {
@@ -932,6 +1027,31 @@ mod tests {
     }
 
     #[test]
+    fn bang() {
+        let mut p = Parser::new(Cursor::new(
+            r#"
+            pkg hello.world
+            
+            !simple {} 
+            "#,
+        ));
+        let pkg = executor::block_on(p.parse()).unwrap();
+        assert_name(&p.lexer.interner, "hello.world", &pkg.name);
+
+        let rule = &pkg.children.unwrap()[0];
+        assert!(matches!(rule, RuleOrProperty::Rule(_)));
+        if let RuleOrProperty::Rule(rule) = rule {
+            assert!(matches!(rule.condition, Condition::Not(_)));
+            if let Condition::Not(rule) = &rule.condition {
+                assert!(matches!(**rule, Condition::Fact(_, None)));
+                if let Condition::Fact(ident, _) = &**rule {
+                    assert_name(&p.lexer.interner, "simple", ident);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn parens() {
         let mut p = Parser::new(Cursor::new(
             r#"
@@ -1166,6 +1286,52 @@ mod tests {
             saturday, sunday {
                 weekend: true
             }
+            "#,
+        ));
+        assert!(matches!(executor::block_on(p.parse()), Ok(_)));
+    }
+
+    #[test]
+    fn accepts2() {
+        let mut p = Parser::new(Cursor::new(
+            r#"
+            pkg test.package weekend:false saturday,sunday{weekend:true}
+            "#,
+        ));
+        assert!(matches!(executor::block_on(p.parse()), Ok(_)));
+    }
+
+    #[test]
+    fn accepts3() {
+        let mut p = Parser::new(Cursor::new(
+            r#"
+            pkg test.package
+            
+            test: [one, two, three]
+            "#,
+        ));
+        assert!(matches!(executor::block_on(p.parse()), Ok(_)));
+    }
+
+    #[test]
+    fn accepts4() {
+        let mut p = Parser::new(Cursor::new(
+            r#"
+            pkg test.package
+            
+            test: { hello: goodbye }
+            "#,
+        ));
+        assert!(matches!(executor::block_on(p.parse()), Ok(_)));
+    }
+
+    #[test]
+    fn accepts5() {
+        let mut p = Parser::new(Cursor::new(
+            r#"
+            pkg test.package
+            
+            test: { hello: [one, two, three, four] }
             "#,
         ));
         assert!(matches!(executor::block_on(p.parse()), Ok(_)));

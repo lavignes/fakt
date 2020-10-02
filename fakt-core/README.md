@@ -66,3 +66,8 @@ saturday, sunday {
     weekend: true
 }
 ```
+
+```
+# It can be on one line!
+pkg test.package weekend:false saturday,sunday{weekend:true}
+```

@@ -4,7 +4,7 @@ use std::{
     sync::Arc, sync::RwLock,
 };
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq, Hash)]
 pub struct Interned<T: ?Sized> {
     slice_id: usize,
     marker: PhantomData<T>,

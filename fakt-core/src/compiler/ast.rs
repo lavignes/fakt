@@ -13,7 +13,7 @@ pub enum Condition {
 #[derive(Debug)]
 pub enum PropertyValue {
     String(Interned<str>),
-    Array(Vec<Interned<str>>),
+    Array(Vec<PropertyValue>),
     Map(FxHashMap<Interned<str>, PropertyValue>),
 }
 
