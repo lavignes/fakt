@@ -1,6 +1,6 @@
 use crate::{
     collections::{Interned, Interner},
-    compiler::{
+    lang::{
         ast::{Condition, Name, Package, Property, PropertyValue, Rule, RuleOrProperty},
         lexer::{self, Lexer, Location, Token},
     },
@@ -632,7 +632,7 @@ impl<R: AsyncRead + Unpin> Parser<R> {
 mod tests {
     use super::*;
     use crate::collections::Interned;
-    use crate::compiler::ast::PropertyValue;
+    use crate::lang::ast::PropertyValue;
     use futures::{executor, io::Cursor};
 
     fn assert_syntax_err(result: Result<Package, Error>, location: (usize, usize), msg: &str) {

@@ -35,10 +35,11 @@ This is the rough EBNF grammar for fakt files:
                          | <map>
                          | <string>
 
-<array>                ::= "[" <value> "]"
-                         | "[" <value> ("," <value>) "]"
+<array>                ::= "[" <value> ("," <value>)* "]"
 
-<map>                  ::= "{" <string> ":" <value> ("," <string> ":" <value>)* "}"
+<map>                  ::= "{" <key-value-pair> ("," <key-value-pair>)* "}"
+
+<key-value-pair>       ::= <string> ":" <value>
 
 <string>               ::= <identifier>
                          | <quoted-string>
