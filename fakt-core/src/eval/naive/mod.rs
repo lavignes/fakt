@@ -16,7 +16,7 @@ pub struct NaiveEvaluator {
 }
 
 impl<T> Evaluate<T> for NaiveEvaluator {
-    fn evaluate() -> Result<T, Error> {
-        unimplemented!()
+    fn evaluate(prop: &str) -> Result<T, Error> {
+        Err(Error::PropertyNotFound)
     }
 }

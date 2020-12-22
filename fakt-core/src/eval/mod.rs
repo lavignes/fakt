@@ -6,7 +6,9 @@ use std::{
 pub mod naive;
 
 #[derive(Debug)]
-pub enum Error {}
+pub enum Error {
+    PropertyNotFound,
+}
 
 impl Display for Error {
     #[inline]
@@ -18,12 +20,10 @@ impl Display for Error {
 impl error::Error for Error {
     #[inline]
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
-        match self {
-            _ => None,
-        }
+        None
     }
 }
 
 pub trait Evaluate<T> {
-    fn evaluate() -> Result<T, Error>;
+    fn evaluate(prop: &str) -> Result<T, Error>;
 }
