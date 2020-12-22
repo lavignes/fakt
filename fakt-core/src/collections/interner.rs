@@ -21,12 +21,12 @@ impl<T: ?Sized> Clone for Interned<T> {
     }
 }
 
-pub unsafe trait Internable {
+pub trait Internable {
     fn to_bytes(&self) -> &[u8];
     fn from_bytes(bytes: &[u8]) -> &Self;
 }
 
-unsafe impl Internable for str {
+impl Internable for str {
     #[inline]
     fn to_bytes(&self) -> &[u8] {
         self.as_bytes()

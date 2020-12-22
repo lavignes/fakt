@@ -631,8 +631,7 @@ impl<R: AsyncRead + Unpin> Parser<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::collections::Interned;
-    use crate::lang::ast::PropertyValue;
+    use crate::{collections::Interned, lang::ast::PropertyValue};
     use futures::{executor, io::Cursor};
 
     fn assert_syntax_err(result: Result<Package, Error>, location: (usize, usize), msg: &str) {
