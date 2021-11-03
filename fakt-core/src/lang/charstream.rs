@@ -1,59 +1,26 @@
+use std::{io, pin::Pin, str};
+
 use futures::{
     task::{Context, Poll},
     AsyncRead, Stream,
 };
-use std::{
-    error,
-    fmt::{self, Display, Formatter},
-    io,
-    pin::Pin,
-    str,
-};
 
-#[derive(Debug)]
-pub enum Error {
-    IoError(io::Error),
-    Utf8Error(str::Utf8Error),
+#[derive(thiserror::Error, Debug)]
+pub(crate) enum Error {
+    #[error(transparent)]
+    IoError(#[from] io::Error),
+
+    #[error(transparent)]
+    Utf8Error(#[from] str::Utf8Error),
 }
 
-impl Display for Error {
-    #[inline]
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        write!(f, "{}", self)
-    }
-}
-
-impl error::Error for Error {
-    #[inline]
-    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
-        match self {
-            Error::IoError(err) => Some(err),
-            Error::Utf8Error(err) => Some(err),
-        }
-    }
-}
-
-impl From<io::Error> for Error {
-    #[inline]
-    fn from(err: io::Error) -> Error {
-        Error::IoError(err)
-    }
-}
-
-impl From<str::Utf8Error> for Error {
-    #[inline]
-    fn from(err: str::Utf8Error) -> Error {
-        Error::Utf8Error(err)
-    }
-}
-
-pub struct CharStream<R> {
+pub(crate) struct CharStream<R> {
     buf: [u8; 4],
     len: usize,
     reader: R,
 }
 
-pub trait CharStreamExt<R: AsyncRead> {
+pub(crate) trait CharStreamExt<R: AsyncRead> {
     fn char_stream(self) -> CharStream<R>;
 }
 
@@ -71,10 +38,7 @@ impl<R: AsyncRead> CharStreamExt<R> for R {
 impl<'a, R: AsyncRead + Unpin> Stream for CharStream<R> {
     type Item = Result<char, Error>;
 
-    fn poll_next(
-        self: Pin<&mut CharStream<R>>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<char, Error>>> {
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<char, Error>>> {
         let (buf, len, mut reader) = {
             let s = self.get_mut();
             (&mut s.buf, &mut s.len, Pin::new(&mut s.reader))
@@ -121,8 +85,9 @@ impl<'a, R: AsyncRead + Unpin> Stream for CharStream<R> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use futures::{io::Cursor, task};
+
+    use super::*;
 
     fn cx<'a>() -> Context<'a> {
         Context::from_waker(task::noop_waker_ref())

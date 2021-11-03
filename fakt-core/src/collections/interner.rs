@@ -1,8 +1,14 @@
-use fxhash::FxHashMap;
 use std::{
-    hash::Hash, marker::PhantomData, ops::DerefMut, ptr::slice_from_raw_parts, rc::Rc, str,
-    sync::Arc, sync::RwLock,
+    hash::Hash,
+    marker::PhantomData,
+    ops::DerefMut,
+    ptr::slice_from_raw_parts,
+    rc::Rc,
+    str,
+    sync::{Arc, RwLock},
 };
+
+use fxhash::FxHashMap;
 
 #[derive(Debug, Eq, PartialEq, Hash)]
 pub struct Interned<T: ?Sized> {
@@ -38,6 +44,7 @@ impl Internable for str {
     }
 }
 
+#[derive(Default, Debug)]
 pub struct Interner<T>
 where
     T: Internable + Eq + Hash + ?Sized + 'static,
@@ -52,8 +59,8 @@ where
     T: Internable + Eq + Hash + ?Sized,
 {
     #[inline]
-    pub fn new() -> Interner<T> {
-        Interner {
+    pub fn new() -> Self {
+        Self {
             map: FxHashMap::default(),
             slices: Vec::new(),
             buffers: vec![Vec::with_capacity(32)],

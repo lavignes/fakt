@@ -1,27 +1,9 @@
-use std::{
-    error,
-    fmt::{self, Display, Formatter},
-};
-
 pub mod naive;
 
-#[derive(Debug)]
+#[derive(thiserror::Error, Debug)]
 pub enum Error {
+    #[error("property not found")]
     PropertyNotFound,
-}
-
-impl Display for Error {
-    #[inline]
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        write!(f, "{}", self)
-    }
-}
-
-impl error::Error for Error {
-    #[inline]
-    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
-        None
-    }
 }
 
 pub trait Evaluate<T> {

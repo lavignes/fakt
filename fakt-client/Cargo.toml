@@ -3,12 +3,10 @@ name = "fakt-client"
 description = "Reference RPC client for fakt"
 version = "0.1.0"
 authors = ["Scott LaVigne <lavignes@amazon.com>"]
-edition = "2018"
+edition = "2021"
 documentation = "https://github.com/lavignes/fakt"
 homepage = "https://github.com/lavignes/fakt"
 repository = "https://github.com/lavignes/fakt"
 license = "Apache-2.0"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]

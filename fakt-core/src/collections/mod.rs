@@ -1,3 +1,3 @@
 mod interner;
 
-pub(crate) use interner::*;
+pub use interner::*;

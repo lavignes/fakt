@@ -1,3 +1,4 @@
-pub(crate) mod ast;
-mod lexer;
-pub(crate) mod parser;
+pub mod ast;
+pub(crate) mod charstream;
+pub(crate) mod lexer;
+pub mod parser;

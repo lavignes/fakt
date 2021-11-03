@@ -1,5 +1,6 @@
-use crate::collections::Interned;
 use fxhash::FxHashMap;
+
+use crate::collections::Interned;
 
 #[derive(Debug)]
 pub enum Condition {

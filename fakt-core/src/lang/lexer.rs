@@ -1,18 +1,19 @@
-use crate::{
-    collections::{Interned, Interner, InternerRcWriteExt},
-    util::charstream::{self, CharStream, CharStreamExt},
-};
-use futures::{
-    task::{Context, Poll},
-    AsyncRead, Stream,
-};
 use std::{
-    error,
     fmt::{self, Display, Formatter},
     io,
     pin::Pin,
     rc::Rc,
     str,
+};
+
+use futures::{
+    task::{Context, Poll},
+    AsyncRead, Stream,
+};
+
+use crate::{
+    collections::{Interned, Interner, InternerRcWriteExt},
+    lang::charstream::{self, CharStream, CharStreamExt},
 };
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -21,31 +22,30 @@ pub struct Location {
     pub(crate) column: usize,
 }
 
-#[derive(Debug)]
+impl Display for Location {
+    #[inline]
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.line, self.column)
+    }
+}
+
+#[derive(thiserror::Error, Debug)]
 pub enum Error {
-    IoError(Location, io::Error),
-    Utf8Error(Location, str::Utf8Error),
-}
+    #[error("{}", .source)]
+    IoError {
+        location: Location,
+        source: io::Error,
+    },
 
-impl Display for Error {
-    #[inline]
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        write!(f, "{}", self)
-    }
-}
-
-impl error::Error for Error {
-    #[inline]
-    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
-        match self {
-            Error::IoError(_, err) => Some(err),
-            Error::Utf8Error(_, err) => Some(err),
-        }
-    }
+    #[error("{}", .source)]
+    Utf8Error {
+        location: Location,
+        source: str::Utf8Error,
+    },
 }
 
 #[derive(Debug, Eq, PartialEq, Clone)]
-pub enum Token {
+pub(crate) enum Token {
     Comment,
     Pkg,
     And,
@@ -68,7 +68,7 @@ pub enum Token {
 
 impl Display for Token {
     #[inline]
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(
             f,
             "{}",
@@ -95,6 +95,7 @@ impl Display for Token {
         )
     }
 }
+
 #[derive(Debug)]
 enum State {
     Root,
@@ -106,7 +107,7 @@ enum State {
     InDoubleQuotedString,
 }
 
-pub struct Lexer<R> {
+pub(crate) struct Lexer<R> {
     inner: CharStream<R>,
     pub(crate) interner: Rc<Interner<str>>,
     start_location: Location,
@@ -117,14 +118,15 @@ pub struct Lexer<R> {
 }
 
 impl<R: AsyncRead + Unpin> Lexer<R> {
+    #[cfg(test)]
     #[inline]
-    pub fn new(reader: R) -> Lexer<R> {
-        Lexer::with_interner(reader, Rc::new(Interner::new()))
+    pub(crate) fn new(reader: R) -> Self {
+        Self::with_interner(reader, Rc::new(Interner::new()))
     }
 
     #[inline]
-    pub fn with_interner(reader: R, interner: Rc<Interner<str>>) -> Lexer<R> {
-        Lexer {
+    pub(crate) fn with_interner(reader: R, interner: Rc<Interner<str>>) -> Self {
+        Self {
             inner: reader.char_stream(),
             interner,
             start_location: Location { line: 1, column: 1 },
@@ -174,7 +176,7 @@ impl<R: AsyncRead + Unpin> Stream for Lexer<R> {
     type Item = Result<(Location, Token), Error>;
 
     fn poll_next(
-        self: Pin<&mut Lexer<R>>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<(Location, Token), Error>>> {
         let (mut stream, interner, start_location, location, buf, stash, state) = {
@@ -344,8 +346,14 @@ impl<R: AsyncRead + Unpin> Stream for Lexer<R> {
             }
 
             Poll::Ready(Some(Err(err))) => Poll::Ready(Some(Err(match err {
-                charstream::Error::Utf8Error(err) => Error::Utf8Error(*location, err),
-                charstream::Error::IoError(err) => Error::IoError(*location, err),
+                charstream::Error::Utf8Error(err) => Error::Utf8Error {
+                    location: *location,
+                    source: err,
+                },
+                charstream::Error::IoError(err) => Error::IoError {
+                    location: *location,
+                    source: err,
+                },
             }))),
             Poll::Pending => {
                 cx.waker().wake_by_ref();
@@ -357,8 +365,9 @@ impl<R: AsyncRead + Unpin> Stream for Lexer<R> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use futures::{io::Cursor, task};
+
+    use super::*;
 
     fn cx<'a>() -> Context<'a> {
         Context::from_waker(task::noop_waker_ref())

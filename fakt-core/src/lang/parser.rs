@@ -1,3 +1,8 @@
+use std::{io, rc::Rc, str};
+
+use futures::{AsyncRead, StreamExt};
+use fxhash::FxHashMap;
+
 use crate::{
     collections::{Interned, Interner},
     lang::{
@@ -5,47 +10,29 @@ use crate::{
         lexer::{self, Lexer, Location, Token},
     },
 };
-use futures::{AsyncRead, StreamExt};
-use fxhash::FxHashMap;
-use std::{
-    error,
-    fmt::{self, Display, Formatter},
-    io,
-    rc::Rc,
-    str,
-};
 
-#[derive(Debug)]
+#[derive(thiserror::Error, Debug)]
 pub enum Error {
-    IoError(Location, io::Error),
-    Utf8Error(Location, str::Utf8Error),
-    SyntaxError(Location, String),
-}
-
-impl Display for Error {
-    #[inline]
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        write!(f, "{}", self)
-    }
-}
-
-impl error::Error for Error {
-    #[inline]
-    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
-        match self {
-            Error::IoError(_, err) => Some(err),
-            Error::Utf8Error(_, err) => Some(err),
-            _ => None,
-        }
-    }
+    #[error("{} {}", .location, .source)]
+    IoError {
+        location: Location,
+        source: io::Error,
+    },
+    #[error("{} {}", .location, .source)]
+    Utf8Error {
+        location: Location,
+        source: str::Utf8Error,
+    },
+    #[error("{} {}", .location, .message)]
+    SyntaxError { location: Location, message: String },
 }
 
 impl From<lexer::Error> for Error {
     #[inline]
-    fn from(err: lexer::Error) -> Error {
+    fn from(err: lexer::Error) -> Self {
         match err {
-            lexer::Error::IoError(location, err) => Error::IoError(location, err),
-            lexer::Error::Utf8Error(location, err) => Error::Utf8Error(location, err),
+            lexer::Error::IoError { location, source } => Self::IoError { location, source },
+            lexer::Error::Utf8Error { location, source } => Self::Utf8Error { location, source },
         }
     }
 }
@@ -56,20 +43,20 @@ enum ConditionOrProperty {
     Property(Property),
 }
 
-struct Parser<R> {
+pub struct Parser<R> {
     lexer: Lexer<R>,
     stash: Option<(Location, Token)>,
 }
 
 impl<R: AsyncRead + Unpin> Parser<R> {
     #[inline]
-    pub fn new(reader: R) -> Parser<R> {
-        Parser::with_interner(reader, Rc::new(Interner::new()))
+    pub fn new(reader: R) -> Self {
+        Self::with_interner(reader, Rc::new(Interner::new()))
     }
 
     #[inline]
-    pub fn with_interner(reader: R, interner: Rc<Interner<str>>) -> Parser<R> {
-        Parser {
+    pub fn with_interner(reader: R, interner: Rc<Interner<str>>) -> Self {
+        Self {
             lexer: Lexer::with_interner(reader, interner),
             stash: None,
         }
@@ -156,20 +143,20 @@ impl<R: AsyncRead + Unpin> Parser<R> {
                 return Err(err);
             }
             None => {
-                return Err(Error::SyntaxError(
-                    self.lexer.location,
-                    "unexpected end of input, expected a rule condition".into(),
-                ));
+                return Err(Error::SyntaxError {
+                    location: self.lexer.location,
+                    message: "unexpected end of input, expected a rule condition".into(),
+                });
             }
         };
         match tok {
             Token::ParenOpen | Token::Identifier(_) | Token::Not | Token::Bang => {
                 self.condition_lowest(None).await
             }
-            other => Err(Error::SyntaxError(
-                self.lexer.location,
-                format!("unexpected {}, expected a rule condition", other),
-            )),
+            other => Err(Error::SyntaxError {
+                location: self.lexer.location,
+                message: format!("unexpected {}, expected a rule condition", other),
+            }),
         }
     }
 
@@ -182,10 +169,11 @@ impl<R: AsyncRead + Unpin> Parser<R> {
                 return Err(err);
             }
             None => {
-                return Err(Error::SyntaxError(
-                    self.lexer.location,
-                    "unexpected end of input, expected a rule operator or rule body".into(),
-                ));
+                return Err(Error::SyntaxError {
+                    location: self.lexer.location,
+                    message: "unexpected end of input, expected a rule operator or rule body"
+                        .into(),
+                });
             }
         };
 
@@ -210,10 +198,11 @@ impl<R: AsyncRead + Unpin> Parser<R> {
                 return Err(err);
             }
             None => {
-                return Err(Error::SyntaxError(
-                    self.lexer.location,
-                    "unexpected end of input, expected a rule operator or rule body".into(),
-                ));
+                return Err(Error::SyntaxError {
+                    location: self.lexer.location,
+                    message: "unexpected end of input, expected a rule operator or rule body"
+                        .into(),
+                });
             }
         };
 
@@ -238,10 +227,11 @@ impl<R: AsyncRead + Unpin> Parser<R> {
                 return Err(err);
             }
             None => {
-                return Err(Error::SyntaxError(
-                    self.lexer.location,
-                    "unexpected end of input, expected a rule operator or rule body".into(),
-                ));
+                return Err(Error::SyntaxError {
+                    location: self.lexer.location,
+                    message: "unexpected end of input, expected a rule operator or rule body"
+                        .into(),
+                });
             }
         };
 
@@ -280,10 +270,11 @@ impl<R: AsyncRead + Unpin> Parser<R> {
                 return Err(err);
             }
             None => {
-                return Err(Error::SyntaxError(
-                    self.lexer.location,
-                    "unexpected end of input, expected a rule operator or rule body".into(),
-                ));
+                return Err(Error::SyntaxError {
+                    location: self.lexer.location,
+                    message: "unexpected end of input, expected a rule operator or rule body"
+                        .into(),
+                });
             }
         };
 
@@ -311,10 +302,10 @@ impl<R: AsyncRead + Unpin> Parser<R> {
                 };
                 Ok(Condition::Fact(name, args))
             }
-            other => Err(Error::SyntaxError(
-                self.lexer.location,
-                format!("unexpected {}, expected a rule condition", other),
-            )),
+            other => Err(Error::SyntaxError {
+                location: self.lexer.location,
+                message: format!("unexpected {}, expected a rule condition", other),
+            }),
         }
     }
 
@@ -426,17 +417,17 @@ impl<R: AsyncRead + Unpin> Parser<R> {
                 if tok == token {
                     Ok((location, tok))
                 } else {
-                    Err(Error::SyntaxError(
+                    Err(Error::SyntaxError {
                         location,
-                        format!("unexpected {}, expected {}", tok, token),
-                    ))
+                        message: format!("unexpected {}, expected {}", tok, token),
+                    })
                 }
             }
             Some(Err(err)) => Err(err),
-            None => Err(Error::SyntaxError(
-                self.lexer.location,
-                format!("unexpected end of input, expected {}", token),
-            )),
+            None => Err(Error::SyntaxError {
+                location: self.lexer.location,
+                message: format!("unexpected end of input, expected {}", token),
+            }),
         }
     }
 
@@ -466,10 +457,10 @@ impl<R: AsyncRead + Unpin> Parser<R> {
                 return Err(err);
             }
             None => {
-                return Err(Error::SyntaxError(
-                    self.lexer.location,
-                    "unexpected end of input, expected a property value".into(),
-                ));
+                return Err(Error::SyntaxError {
+                    location: self.lexer.location,
+                    message: "unexpected end of input, expected a property value".into(),
+                });
             }
         };
 
@@ -489,10 +480,10 @@ impl<R: AsyncRead + Unpin> Parser<R> {
                 Ok((location, PropertyValue::Map(m)))
             }
 
-            other => Err(Error::SyntaxError(
-                self.lexer.location,
-                format!("unexpected {}, expected a property value", other),
-            )),
+            other => Err(Error::SyntaxError {
+                location: self.lexer.location,
+                message: format!("unexpected {}, expected a property value", other),
+            }),
         }
     }
 
@@ -565,17 +556,17 @@ impl<R: AsyncRead + Unpin> Parser<R> {
                 if let Token::Identifier(_) = tok {
                     Ok((location, tok))
                 } else {
-                    Err(Error::SyntaxError(
+                    Err(Error::SyntaxError {
                         location,
-                        format!("unexpected {}, expected an identifier", tok),
-                    ))
+                        message: format!("unexpected {}, expected an identifier", tok),
+                    })
                 }
             }
             Some(Err(err)) => Err(err),
-            None => Err(Error::SyntaxError(
-                self.lexer.location,
-                "unexpected end of input, expected an identifier".into(),
-            )),
+            None => Err(Error::SyntaxError {
+                location: self.lexer.location,
+                message: "unexpected end of input, expected an identifier".into(),
+            }),
         }
     }
 
@@ -584,16 +575,16 @@ impl<R: AsyncRead + Unpin> Parser<R> {
             Some(Ok((location, tok))) => match tok {
                 Token::String(s) => Ok((location, s)),
                 Token::Identifier(s) => Ok((location, s)),
-                _ => Err(Error::SyntaxError(
+                _ => Err(Error::SyntaxError {
                     location,
-                    format!("unexpected {}, expected a string", tok),
-                )),
+                    message: format!("unexpected {}, expected a string", tok),
+                }),
             },
             Some(Err(err)) => Err(err),
-            None => Err(Error::SyntaxError(
-                self.lexer.location,
-                "unexpected end of input, expected a string".into(),
-            )),
+            None => Err(Error::SyntaxError {
+                location: self.lexer.location,
+                message: "unexpected end of input, expected a string".into(),
+            }),
         }
     }
 
@@ -630,16 +621,21 @@ impl<R: AsyncRead + Unpin> Parser<R> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::{collections::Interned, lang::ast::PropertyValue};
     use futures::{executor, io::Cursor};
 
+    use super::*;
+    use crate::{collections::Interned, lang::ast::PropertyValue};
+
     fn assert_syntax_err(result: Result<Package, Error>, location: (usize, usize), msg: &str) {
-        assert!(matches!(result, Err(Error::SyntaxError(_, _))));
-        if let Err(Error::SyntaxError(loc, m)) = result {
+        assert!(matches!(result, Err(Error::SyntaxError { .. })));
+        if let Err(Error::SyntaxError {
+            location: loc,
+            message,
+        }) = result
+        {
             assert_eq!(location.0, loc.line);
             assert_eq!(location.1, loc.column);
-            assert_eq!(msg, m);
+            assert_eq!(msg, message);
         }
     }
 
