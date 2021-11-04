@@ -1,0 +1,11 @@
+{
+  "configurations": {
+    "launch": {
+      "adapter": "CodeLLDB",
+      "configuration": {
+        "request": "launch",
+        "program": "${workspaceRoot}/target/debug/deps/fakt_core-bf0d45c589c0c015"
+      }
+    }
+  }
+}

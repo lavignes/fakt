@@ -27,13 +27,13 @@ This is the rough EBNF grammar for fakt files:
 <fact>                 ::= <name> "[" <args> "]"
                          | <name>
 
-<args>                 ::= <string> ("," <string>)*
+<args>                 ::= <primitive> ("," <primitive>)*
 
 <property>             ::= <name> ":" <value>
 
 <value>                ::= <array>
                          | <map>
-                         | <string>
+                         | <primitive>
 
 <array>                ::= "[" <value> ("," <value>)* "]"
 
@@ -45,6 +45,17 @@ This is the rough EBNF grammar for fakt files:
                          | <quoted-string>
                          | <double-quoted-string>
                          | <unquoted-string>
+
+<primitive>            ::= <integer>
+                         | <unsigned-integer>
+                         | <float>
+                         | <string>
+
+<integer>              ::= /-?[\p{Number}i?]+/
+
+<integer>              ::= /[\p{Number}u?]+/
+
+<float>                ::= <-- IEEE 754 64-bit float. (with optional trailing 'f') -->
 
 <identifier>           ::= /\p{Letter}[\p{Number}]*/
 

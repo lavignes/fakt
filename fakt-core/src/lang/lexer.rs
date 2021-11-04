@@ -29,22 +29,26 @@ impl Display for Location {
     }
 }
 
+#[allow(clippy::enum_variant_names)]
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
-    #[error("{}", .source)]
+    #[error("{} malformed number", .location)]
+    MalformedNumber { location: Location },
+
+    #[error("{} {}", .location, .source)]
     IoError {
         location: Location,
         source: io::Error,
     },
 
-    #[error("{}", .source)]
+    #[error("{} {}", .location, .source)]
     Utf8Error {
         location: Location,
         source: str::Utf8Error,
     },
 }
 
-#[derive(Debug, Eq, PartialEq, Clone)]
+#[derive(Debug, Clone)]
 pub(crate) enum Token {
     Comment,
     Pkg,
@@ -62,9 +66,44 @@ pub(crate) enum Token {
     BraceClose,
     BracketOpen,
     BracketClose,
+    Int(i64),
+    UInt(u64),
+    Float(f64),
     String(Interned<str>),
     Identifier(Interned<str>),
 }
+
+impl PartialEq for Token {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Comment, Self::Comment) => true,
+            (Self::Pkg, Self::Pkg) => true,
+            (Self::And, Self::And) => true,
+            (Self::Or, Self::Or) => true,
+            (Self::Xor, Self::Xor) => true,
+            (Self::Not, Self::Not) => true,
+            (Self::Bang, Self::Bang) => true,
+            (Self::Colon, Self::Colon) => true,
+            (Self::Comma, Self::Comma) => true,
+            (Self::Dot, Self::Dot) => true,
+            (Self::ParenOpen, Self::ParenOpen) => true,
+            (Self::ParenClose, Self::ParenClose) => true,
+            (Self::BraceOpen, Self::BraceOpen) => true,
+            (Self::BraceClose, Self::BraceClose) => true,
+            (Self::BracketOpen, Self::BracketOpen) => true,
+            (Self::BracketClose, Self::BracketClose) => true,
+            (Self::Int(a), Self::Int(b)) if a == b => true,
+            (Self::UInt(a), Self::UInt(b)) if a == b => true,
+            (Self::Float(a), Self::Float(b)) if a == b => true,
+            (Self::String(a), Self::String(b)) if a == b => true,
+            (Self::Identifier(a), Self::Identifier(b)) if a == b => true,
+            (_, _) => false,
+        }
+    }
+}
+
+impl Eq for Token {}
 
 impl Display for Token {
     #[inline]
@@ -73,24 +112,27 @@ impl Display for Token {
             f,
             "{}",
             match self {
-                Token::Comment => "comment",
-                Token::Pkg => "\"pkg\"",
-                Token::And => "\"and\"",
-                Token::Or => "\"or\"",
-                Token::Xor => "\"xor\"",
-                Token::Not => "\"not\"",
-                Token::Bang => "\"!\"",
-                Token::Colon => "\":\"",
-                Token::Comma => "\",\"",
-                Token::Dot => "\".\"",
-                Token::ParenOpen => "\"(\"",
-                Token::ParenClose => "\")\"",
-                Token::BraceOpen => "\"{\"",
-                Token::BraceClose => "\"}\"",
-                Token::BracketOpen => "\"[\"",
-                Token::BracketClose => "\"]\"",
-                Token::String(_) => "\"string\"",
-                Token::Identifier(_) => "\"identifier\"",
+                Self::Comment => "comment",
+                Self::Pkg => "\"pkg\"",
+                Self::And => "\"and\"",
+                Self::Or => "\"or\"",
+                Self::Xor => "\"xor\"",
+                Self::Not => "\"not\"",
+                Self::Bang => "\"!\"",
+                Self::Colon => "\":\"",
+                Self::Comma => "\",\"",
+                Self::Dot => "\".\"",
+                Self::ParenOpen => "\"(\"",
+                Self::ParenClose => "\")\"",
+                Self::BraceOpen => "\"{\"",
+                Self::BraceClose => "\"}\"",
+                Self::BracketOpen => "\"[\"",
+                Self::BracketClose => "\"]\"",
+                Self::Int(_) => "\"integer\"",
+                Self::UInt(_) => "\"unsigned integer\"",
+                Self::Float(_) => "\"float\"",
+                Self::String(_) => "\"string\"",
+                Self::Identifier(_) => "\"identifier\"",
             }
         )
     }
@@ -101,6 +143,7 @@ enum State {
     Root,
 
     InComment,
+    InNumeric,
     InIdentifier,
     InUnquotedString,
     InQuotedString,
@@ -172,6 +215,11 @@ fn check_keyword(identifier: &str) -> Option<Token> {
     }
 }
 
+#[inline]
+fn is_numeric(ch: char) -> bool {
+    ch.is_numeric() || (ch == '.') || (ch == '+') || (ch == '-')
+}
+
 impl<R: AsyncRead + Unpin> Stream for Lexer<R> {
     type Item = Result<(Location, Token), Error>;
 
@@ -234,6 +282,10 @@ impl<R: AsyncRead + Unpin> Stream for Lexer<R> {
                     } else if c.is_whitespace() {
                         cx.waker().wake_by_ref();
                         return Poll::Pending;
+                    } else if is_numeric(c) {
+                        buf.push(c);
+                        *start_location = *location;
+                        *state = State::InNumeric;
                     } else {
                         buf.push(c);
                         *start_location = *location;
@@ -247,6 +299,63 @@ impl<R: AsyncRead + Unpin> Stream for Lexer<R> {
                     if c == '\n' {
                         *state = State::Root;
                         return Poll::Ready(Some(Ok((*start_location, Token::Comment))));
+                    }
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+
+                State::InNumeric => {
+                    if is_numeric(c) {
+                        buf.push(c);
+                    } else if c == 'i' {
+                        *state = State::Root;
+                        let result = buf.parse::<i64>();
+                        buf.clear();
+                        return Poll::Ready(Some(match result {
+                            Ok(int) => Ok((*start_location, Token::Int(int))),
+                            Err(_) => Err(Error::MalformedNumber {
+                                location: *start_location,
+                            }),
+                        }));
+                    } else if c == 'u' {
+                        *state = State::Root;
+                        let result = buf.parse::<u64>();
+                        buf.clear();
+                        return Poll::Ready(Some(match result {
+                            Ok(uint) => Ok((*start_location, Token::UInt(uint))),
+                            Err(_) => Err(Error::MalformedNumber {
+                                location: *start_location,
+                            }),
+                        }));
+                    } else if c == 'f' {
+                        *state = State::Root;
+                        let result = buf.parse::<f64>();
+                        buf.clear();
+                        return Poll::Ready(Some(match result {
+                            Ok(float) => Ok((*start_location, Token::Float(float))),
+                            Err(_) => Err(Error::MalformedNumber {
+                                location: *start_location,
+                            }),
+                        }));
+                    } else {
+                        // save it for later
+                        *stash = Some(c);
+                        *state = State::Root;
+                        if let Ok(int) = buf.parse::<i64>() {
+                            buf.clear();
+                            return Poll::Ready(Some(Ok((*start_location, Token::Int(int)))));
+                        }
+                        if let Ok(uint) = buf.parse::<u64>() {
+                            buf.clear();
+                            return Poll::Ready(Some(Ok((*start_location, Token::UInt(uint)))));
+                        }
+                        let result = buf.parse::<f64>();
+                        return Poll::Ready(Some(match result {
+                            Ok(float) => Ok((*start_location, Token::Float(float))),
+                            Err(_) => Err(Error::MalformedNumber {
+                                location: *start_location,
+                            }),
+                        }));
                     }
                     cx.waker().wake_by_ref();
                     Poll::Pending
@@ -511,6 +620,42 @@ mod tests {
     }
 
     #[test]
+    fn integer() {
+        let mut cx = cx();
+        let mut lexer = Lexer::new(Cursor::new("1234i"));
+        assert_pending(&mut cx, &mut lexer);
+        assert_pending(&mut cx, &mut lexer);
+        assert_pending(&mut cx, &mut lexer);
+        assert_pending(&mut cx, &mut lexer);
+        assert_token(&mut cx, &mut lexer, (1, 1), Token::Int(1234));
+        assert_none(&mut cx, &mut lexer);
+    }
+
+    #[test]
+    fn unsinged_integer() {
+        let mut cx = cx();
+        let mut lexer = Lexer::new(Cursor::new("1234u"));
+        assert_pending(&mut cx, &mut lexer);
+        assert_pending(&mut cx, &mut lexer);
+        assert_pending(&mut cx, &mut lexer);
+        assert_pending(&mut cx, &mut lexer);
+        assert_token(&mut cx, &mut lexer, (1, 1), Token::UInt(1234));
+        assert_none(&mut cx, &mut lexer);
+    }
+
+    #[test]
+    fn float() {
+        let mut cx = cx();
+        let mut lexer = Lexer::new(Cursor::new("1234f"));
+        assert_pending(&mut cx, &mut lexer);
+        assert_pending(&mut cx, &mut lexer);
+        assert_pending(&mut cx, &mut lexer);
+        assert_pending(&mut cx, &mut lexer);
+        assert_token(&mut cx, &mut lexer, (1, 1), Token::Float(1234.0));
+        assert_none(&mut cx, &mut lexer);
+    }
+
+    #[test]
     fn quoted_string() {
         let mut cx = cx();
         let mut lexer = Lexer::new(Cursor::new("'test'"));
@@ -554,19 +699,22 @@ mod tests {
     #[test]
     fn unquoted_string1() {
         let mut cx = cx();
-        let mut lexer = Lexer::new(Cursor::new("42"));
-        let forty_two = lexer.interner.intern("42").unwrap();
+        let mut lexer = Lexer::new(Cursor::new("~nice"));
+        let nice = lexer.interner.intern("~nice").unwrap();
         assert_pending(&mut cx, &mut lexer);
         assert_pending(&mut cx, &mut lexer);
-        assert_token(&mut cx, &mut lexer, (1, 1), Token::String(forty_two));
+        assert_pending(&mut cx, &mut lexer);
+        assert_pending(&mut cx, &mut lexer);
+        assert_pending(&mut cx, &mut lexer);
+        assert_token(&mut cx, &mut lexer, (1, 1), Token::String(nice));
         assert_none(&mut cx, &mut lexer);
     }
 
     #[test]
     fn unquoted_string2() {
         let mut cx = cx();
-        let mut lexer = Lexer::new(Cursor::new("1test-is-a-test"));
-        let this_is_a_test = lexer.interner.intern("1test-is-a-test").unwrap();
+        let mut lexer = Lexer::new(Cursor::new("*test-is-a-test"));
+        let this_is_a_test = lexer.interner.intern("*test-is-a-test").unwrap();
         assert_pending(&mut cx, &mut lexer);
         assert_pending(&mut cx, &mut lexer);
         assert_pending(&mut cx, &mut lexer);

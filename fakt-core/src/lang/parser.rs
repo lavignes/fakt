@@ -6,7 +6,7 @@ use fxhash::FxHashMap;
 use crate::{
     collections::{Interned, Interner},
     lang::{
-        ast::{Condition, Name, Package, Property, PropertyValue, Rule, RuleOrProperty},
+        ast::{Condition, Name, Package, Primitive, Property, PropertyValue, Rule, RuleOrProperty},
         lexer::{self, Lexer, Location, Token},
     },
 };
@@ -33,6 +33,10 @@ impl From<lexer::Error> for Error {
         match err {
             lexer::Error::IoError { location, source } => Self::IoError { location, source },
             lexer::Error::Utf8Error { location, source } => Self::Utf8Error { location, source },
+            lexer::Error::MalformedNumber { location } => Self::SyntaxError {
+                location,
+                message: "malformed number".to_string(),
+            },
         }
     }
 }
@@ -354,7 +358,7 @@ impl<R: AsyncRead + Unpin> Parser<R> {
         }
     }
 
-    async fn args_opt(&mut self) -> Option<Result<Vec<Interned<str>>, Error>> {
+    async fn args_opt(&mut self) -> Option<Result<Vec<Primitive>, Error>> {
         match self.expect_simple_token_opt(Token::BracketOpen).await {
             Some(Ok(_)) => {}
             Some(Err(err)) => {
@@ -367,8 +371,8 @@ impl<R: AsyncRead + Unpin> Parser<R> {
 
         let mut args = Vec::new();
         loop {
-            match self.expect_string().await {
-                Ok((_, s)) => args.push(s),
+            match self.expect_primitive().await {
+                Ok((_, p)) => args.push(p),
                 Err(err) => {
                     return Some(Err(err));
                 }
@@ -465,9 +469,13 @@ impl<R: AsyncRead + Unpin> Parser<R> {
         };
 
         match tok {
-            Token::String(_) | Token::Identifier(_) => {
-                let (location, s) = self.expect_string().await?;
-                Ok((location, PropertyValue::String(s)))
+            Token::String(_)
+            | Token::Identifier(_)
+            | Token::Int(_)
+            | Token::UInt(_)
+            | Token::Float(_) => {
+                let (location, p) = self.expect_primitive().await?;
+                Ok((location, PropertyValue::Primitive(p)))
             }
 
             Token::BracketOpen => {
@@ -588,6 +596,27 @@ impl<R: AsyncRead + Unpin> Parser<R> {
         }
     }
 
+    async fn expect_primitive(&mut self) -> Result<(Location, Primitive), Error> {
+        match self.next().await {
+            Some(Ok((location, tok))) => match tok {
+                Token::String(s) => Ok((location, Primitive::String(s))),
+                Token::Identifier(s) => Ok((location, Primitive::String(s))),
+                Token::Int(i) => Ok((location, Primitive::Int(i))),
+                Token::UInt(u) => Ok((location, Primitive::UInt(u))),
+                Token::Float(f) => Ok((location, Primitive::Float(f))),
+                _ => Err(Error::SyntaxError {
+                    location,
+                    message: format!("unexpected {}, expected a string or number", tok),
+                }),
+            },
+            Some(Err(err)) => Err(err),
+            None => Err(Error::SyntaxError {
+                location: self.lexer.location,
+                message: "unexpected end of input, expected a string or number".into(),
+            }),
+        }
+    }
+
     /// Peek the next token
     async fn peek(&mut self) -> Option<Result<(Location, Token), Error>> {
         match self.next().await? {
@@ -644,7 +673,7 @@ mod tests {
     }
 
     fn assert_name(interner: &Interner<str>, s: &str, name: &Name) {
-        for (expected, actual) in s.split(".").zip(name.parts.iter()) {
+        for (expected, actual) in s.split('.').zip(name.parts.iter()) {
             assert_str(interner, expected, *actual);
         }
     }
@@ -713,10 +742,10 @@ mod tests {
         assert!(matches!(prop, RuleOrProperty::Property(_)));
         if let RuleOrProperty::Property(prop) = prop {
             assert_name(&p.lexer.interner, "prop.name", &prop.name);
-            assert!(matches!(prop.value, PropertyValue::String(_)));
-            if let PropertyValue::String(value) = prop.value {
-                assert_str(&p.lexer.interner, "12345", value);
-            }
+            assert!(matches!(
+                prop.value,
+                PropertyValue::Primitive(Primitive::Int(12345))
+            ));
         }
     }
 
@@ -738,18 +767,21 @@ mod tests {
         assert!(matches!(prop, RuleOrProperty::Property(_)));
         if let RuleOrProperty::Property(prop) = prop {
             assert_name(&p.lexer.interner, "prop.name1", &prop.name);
-            assert!(matches!(prop.value, PropertyValue::String(_)));
-            if let PropertyValue::String(value) = prop.value {
-                assert_str(&p.lexer.interner, "12345", value);
-            }
+            assert!(matches!(
+                prop.value,
+                PropertyValue::Primitive(Primitive::Int(12345))
+            ));
         }
 
         let prop = &children[1];
         assert!(matches!(prop, RuleOrProperty::Property(_)));
         if let RuleOrProperty::Property(prop) = prop {
             assert_name(&p.lexer.interner, "prop.name2", &prop.name);
-            assert!(matches!(prop.value, PropertyValue::String(_)));
-            if let PropertyValue::String(value) = prop.value {
+            assert!(matches!(
+                prop.value,
+                PropertyValue::Primitive(Primitive::String(_))
+            ));
+            if let PropertyValue::Primitive(Primitive::String(value)) = prop.value {
                 assert_str(&p.lexer.interner, "hello!", value);
             }
         }
@@ -821,8 +853,11 @@ mod tests {
                 assert!(matches!(prop, RuleOrProperty::Property(_)));
                 if let RuleOrProperty::Property(prop) = prop {
                     assert_name(&p.lexer.interner, "level1.prop", &prop.name);
-                    assert!(matches!(prop.value, PropertyValue::String(_)));
-                    if let PropertyValue::String(value) = prop.value {
+                    assert!(matches!(
+                        prop.value,
+                        PropertyValue::Primitive(Primitive::String(_))
+                    ));
+                    if let PropertyValue::Primitive(Primitive::String(value)) = prop.value {
                         assert_str(&p.lexer.interner, "hello", value);
                     }
                 }
@@ -840,8 +875,11 @@ mod tests {
                         assert!(matches!(prop, RuleOrProperty::Property(_)));
                         if let RuleOrProperty::Property(prop) = prop {
                             assert_name(&p.lexer.interner, "level2.prop", &prop.name);
-                            assert!(matches!(prop.value, PropertyValue::String(_)));
-                            if let PropertyValue::String(value) = prop.value {
+                            assert!(matches!(
+                                prop.value,
+                                PropertyValue::Primitive(Primitive::String(_))
+                            ));
+                            if let PropertyValue::Primitive(Primitive::String(value)) = prop.value {
                                 assert_str(&p.lexer.interner, "world", value);
                             }
                         }
@@ -1234,7 +1272,10 @@ mod tests {
             if let Condition::Fact(ident, args) = &rule.condition {
                 assert_name(&p.lexer.interner, "simple", ident);
                 if let Some(args) = args {
-                    assert_str(&p.lexer.interner, "arg0", args[0]);
+                    assert!(matches!(args[0], Primitive::String(_)));
+                    if let Primitive::String(value) = args[0] {
+                        assert_str(&p.lexer.interner, "arg0", value);
+                    }
                 }
             }
             assert!(matches!(rule.children, None));
@@ -1247,7 +1288,7 @@ mod tests {
             r#"
             pkg hello.world
             
-            simple[arg0, "arg1", 12345] {}
+            simple[arg0, "arg1", -1234, 1234u, 12.34] {}
             "#,
         ));
         let pkg = executor::block_on(p.parse()).unwrap();
@@ -1260,9 +1301,19 @@ mod tests {
             if let Condition::Fact(ident, args) = &rule.condition {
                 assert_name(&p.lexer.interner, "simple", ident);
                 if let Some(args) = args {
-                    assert_str(&p.lexer.interner, "arg0", args[0]);
-                    assert_str(&p.lexer.interner, "arg1", args[1]);
-                    assert_str(&p.lexer.interner, "12345", args[2]);
+                    assert!(matches!(args[0], Primitive::String(_)));
+                    if let Primitive::String(value) = args[0] {
+                        assert_str(&p.lexer.interner, "arg0", value);
+                    }
+                    assert!(matches!(args[1], Primitive::String(_)));
+                    if let Primitive::String(value) = args[1] {
+                        assert_str(&p.lexer.interner, "arg1", value);
+                    }
+                    assert!(matches!(args[2], Primitive::Int(-1234)));
+                    assert!(matches!(args[3], Primitive::UInt(1234)));
+                    assert!(
+                        matches!(args[4], Primitive::Float(f) if (f - 12.34f64).abs() < f64::EPSILON)
+                    );
                 }
             }
             assert!(matches!(rule.children, None));

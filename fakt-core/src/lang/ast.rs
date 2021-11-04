@@ -6,7 +6,7 @@ use crate::collections::Interned;
 //   to a pool data structure.
 #[derive(Debug)]
 pub enum Condition {
-    Fact(Name, Option<Vec<Interned<str>>>),
+    Fact(Name, Option<Vec<Primitive>>),
     And(Box<Condition>, Box<Condition>),
     Or(Box<Condition>, Box<Condition>),
     Xor(Box<Condition>, Box<Condition>),
@@ -14,8 +14,16 @@ pub enum Condition {
 }
 
 #[derive(Debug)]
-pub enum PropertyValue {
+pub enum Primitive {
     String(Interned<str>),
+    Int(i64),
+    UInt(u64),
+    Float(f64),
+}
+
+#[derive(Debug)]
+pub enum PropertyValue {
+    Primitive(Primitive),
     Array(Vec<PropertyValue>),
     Map(FxHashMap<Interned<str>, PropertyValue>),
 }
