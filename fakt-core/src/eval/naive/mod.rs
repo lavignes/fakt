@@ -11,7 +11,7 @@ use crate::{
 //   using the actual rule representing the tree node.
 struct Props {}
 
-pub struct NaiveEvaluator {
+pub(crate) struct NaiveEvaluator {
     _logic: FxHashMap<Interned<str>, Props>,
 }
 

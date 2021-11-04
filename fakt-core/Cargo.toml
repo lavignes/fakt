@@ -9,9 +9,15 @@ homepage = "https://github.com/lavignes/fakt"
 repository = "https://github.com/lavignes/fakt"
 license = "Apache-2.0"
 
+[features]
+default = ["eval_naive"]
+eval_wasm = ["wasmtime"]
+eval_naive = []
+
 [dependencies]
-"thiserror" = "1.0"
-log = "0.4"
-futures = "0.3"
 async-recursion = "0.3"
+futures = "0.3"
 fxhash = "0.2"
+log = "0.4"
+thiserror = "1.0"
+wasmtime = { version = "0.31", optional = true }

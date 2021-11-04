@@ -1,4 +1,5 @@
-pub mod naive;
+#[cfg(target_feature="eval_naive")]
+mod naive;
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
