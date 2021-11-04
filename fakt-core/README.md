@@ -53,7 +53,7 @@ This is the rough EBNF grammar for fakt files:
 
 <integer>              ::= /-?[\p{Number}i?]+/
 
-<integer>              ::= /[\p{Number}u?]+/
+<unsigned-integer>     ::= /[\p{Number}u?]+/
 
 <float>                ::= <-- IEEE 754 64-bit float. (with optional trailing 'f') -->
 
