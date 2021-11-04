@@ -2,6 +2,8 @@ use fxhash::FxHashMap;
 
 use crate::collections::Interned;
 
+// FIXME(lavignes): The AST is a real tree right now, but needs to migrate
+//   to a pool data structure.
 #[derive(Debug)]
 pub enum Condition {
     Fact(Name, Option<Vec<Interned<str>>>),

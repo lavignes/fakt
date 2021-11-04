@@ -273,7 +273,8 @@ impl<R: AsyncRead + Unpin> Stream for Lexer<R> {
                 }
 
                 State::InUnquotedString => {
-                    // FIXME: The conditions to exit an unquoted string are ambiguous
+                    // Unquoted strings terminate on symbols or whitespace.
+                    // TODO(lavignes): What if new symbols are added to the language?
                     if check_symbol(c).is_some() || c.is_whitespace() {
                         *stash = Some(c);
                         *state = State::Root;
