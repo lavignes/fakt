@@ -13,7 +13,7 @@ use futures::{
 
 use crate::{
     collections::{Interned, Interner, InternerRcWriteExt},
-    lang::charstream::{self, CharStream, CharStreamExt},
+    lang::asyncstr::{self, AsyncStrReader},
 };
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -150,17 +150,21 @@ enum State {
     InDoubleQuotedString,
 }
 
-pub(crate) struct Lexer<R> {
-    inner: CharStream<R>,
-    pub(crate) interner: Rc<Interner<str>>,
-    start_location: Location,
-    pub(crate) location: Location,
-    buf: String,
-    stash: Option<char>,
-    state: State,
+pin_project_lite::pin_project! {
+    #[must_use = "streams do nothing unless polled"]
+    pub(crate) struct Lexer<R> {
+        #[pin]
+        reader: AsyncStrReader<R>,
+        pub(crate) interner: Rc<Interner<str>>,
+        start_location: Location,
+        pub(crate) location: Location,
+        buf: String,
+        stash: Option<char>,
+        state: State,
+    }
 }
 
-impl<R: AsyncRead + Unpin> Lexer<R> {
+impl<'a, R: AsyncRead + Unpin> Lexer<R> {
     #[cfg(test)]
     #[inline]
     pub(crate) fn new(reader: R) -> Self {
@@ -170,7 +174,7 @@ impl<R: AsyncRead + Unpin> Lexer<R> {
     #[inline]
     pub(crate) fn with_interner(reader: R, interner: Rc<Interner<str>>) -> Self {
         Self {
-            inner: reader.char_stream(),
+            reader: AsyncStrReader::new(reader),
             interner,
             start_location: Location { line: 1, column: 1 },
             location: Location { line: 1, column: 0 },
@@ -227,69 +231,63 @@ impl<R: AsyncRead + Unpin> Stream for Lexer<R> {
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<(Location, Token), Error>>> {
-        let (mut stream, interner, start_location, location, buf, stash, state) = {
-            let s = self.get_mut();
-            (
-                Pin::new(&mut s.inner),
-                &mut s.interner,
-                &mut s.start_location,
-                &mut s.location,
-                &mut s.buf,
-                &mut s.stash,
-                &mut s.state,
-            )
-        };
+        let mut this = self.project();
 
         // If we find a char that ends a token, we put it back into the stash.
         // Here we try to remove that item from the stash and if it doesn't exist, we poll.
-        match stash
+        // TODO(lavignes): Right now we poll for every token. We should move to emitting
+        //   slices of tokens from a buffer, much like the way `AsyncStrReader` works now.
+        match this
+            .stash
             .take()
             .map(|c| Poll::Ready(Some(Ok(c))))
-            .or_else(|| {
-                // Raw number tracking from the polled stream
-                Some(match stream.as_mut().poll_next(cx) {
-                    Poll::Ready(Some(Ok(c))) => {
-                        location.column += 1;
+            .unwrap_or_else(|| match this.reader.as_mut().poll_fill_buf(cx) {
+                Poll::Ready(Ok(s)) => {
+                    if s.is_empty() {
+                        Poll::Ready(None)
+                    } else {
+                        let c = s.chars().next().unwrap();
+                        this.reader.consume(c.len_utf8());
+                        this.location.column += 1;
                         if c == '\n' {
-                            location.line += 1;
-                            location.column = 1;
+                            this.location.line += 1;
+                            this.location.column = 1;
                         }
                         Poll::Ready(Some(Ok(c)))
                     }
-                    other => other,
-                })
-            })
-            .unwrap()
-        {
-            Poll::Ready(Some(Ok(c))) => match *state {
+                }
+                Poll::Ready(Err(err)) => Poll::Ready(Some(Err(err))),
+                Poll::Pending => Poll::Pending,
+            }) {
+            Poll::Ready(Some(Ok(c))) => match *this.state {
                 State::Root => {
                     if let Some(sym) = check_symbol(c) {
-                        *start_location = *location;
-                        return Poll::Ready(Some(Ok((*start_location, sym))));
+                        *this.start_location = *this.location;
+                        return Poll::Ready(Some(Ok((*this.start_location, sym))));
                     } else if is_identifier_start(c) {
-                        buf.push(c);
-                        *start_location = *location;
-                        *state = State::InIdentifier;
+                        this.buf.push(c);
+                        *this.start_location = *this.location;
+                        *this.state = State::InIdentifier;
                     } else if c == '\'' {
-                        *start_location = *location;
-                        *state = State::InQuotedString;
+                        *this.start_location = *this.location;
+                        *this.state = State::InQuotedString;
                     } else if c == '"' {
-                        *start_location = *location;
-                        *state = State::InDoubleQuotedString;
+                        *this.start_location = *this.location;
+                        *this.state = State::InDoubleQuotedString;
                     } else if c == '#' {
-                        *start_location = *location;
-                        *state = State::InComment;
+                        *this.start_location = *this.location;
+                        *this.state = State::InComment;
                     } else if c.is_whitespace() {
                         cx.waker().wake_by_ref();
                         return Poll::Pending;
                     } else if is_numeric(c) {
-                        buf.push(c);
-                        *start_location = *location;
-                        *state = State::InNumeric;
+                        this.buf.push(c);
+                        *this.start_location = *this.location;
+                        *this.state = State::InNumeric;
                     } else {
-                        buf.push(c);
-                        *start_location = *location;
-                        *state = State::InUnquotedString;
+                        this.buf.push(c);
+                        *this.start_location = *this.location;
+                        *this.state = State::InUnquotedString;
                     }
                     cx.waker().wake_by_ref();
                     Poll::Pending
@@ -297,8 +295,8 @@ impl<R: AsyncRead + Unpin> Stream for Lexer<R> {
 
                 State::InComment => {
                     if c == '\n' {
-                        *state = State::Root;
-                        return Poll::Ready(Some(Ok((*start_location, Token::Comment))));
+                        *this.state = State::Root;
+                        return Poll::Ready(Some(Ok((*this.start_location, Token::Comment))));
                     }
                     cx.waker().wake_by_ref();
                     Poll::Pending
@@ -306,54 +304,57 @@ impl<R: AsyncRead + Unpin> Stream for Lexer<R> {
 
                 State::InNumeric => {
                     if is_numeric(c) {
-                        buf.push(c);
+                        this.buf.push(c);
                     } else if c == 'i' {
-                        *state = State::Root;
-                        let result = buf.parse::<i64>();
-                        buf.clear();
+                        *this.state = State::Root;
+                        let result = this.buf.parse::<i64>();
+                        this.buf.clear();
                         return Poll::Ready(Some(match result {
-                            Ok(int) => Ok((*start_location, Token::Int(int))),
+                            Ok(int) => Ok((*this.start_location, Token::Int(int))),
                             Err(_) => Err(Error::MalformedNumber {
-                                location: *start_location,
+                                location: *this.start_location,
                             }),
                         }));
                     } else if c == 'u' {
-                        *state = State::Root;
-                        let result = buf.parse::<u64>();
-                        buf.clear();
+                        *this.state = State::Root;
+                        let result = this.buf.parse::<u64>();
+                        this.buf.clear();
                         return Poll::Ready(Some(match result {
-                            Ok(uint) => Ok((*start_location, Token::UInt(uint))),
+                            Ok(uint) => Ok((*this.start_location, Token::UInt(uint))),
                             Err(_) => Err(Error::MalformedNumber {
-                                location: *start_location,
+                                location: *this.start_location,
                             }),
                         }));
                     } else if c == 'f' {
-                        *state = State::Root;
-                        let result = buf.parse::<f64>();
-                        buf.clear();
+                        *this.state = State::Root;
+                        let result = this.buf.parse::<f64>();
+                        this.buf.clear();
                         return Poll::Ready(Some(match result {
-                            Ok(float) => Ok((*start_location, Token::Float(float))),
+                            Ok(float) => Ok((*this.start_location, Token::Float(float))),
                             Err(_) => Err(Error::MalformedNumber {
-                                location: *start_location,
+                                location: *this.start_location,
                             }),
                         }));
                     } else {
                         // save it for later
-                        *stash = Some(c);
-                        *state = State::Root;
-                        if let Ok(int) = buf.parse::<i64>() {
-                            buf.clear();
-                            return Poll::Ready(Some(Ok((*start_location, Token::Int(int)))));
+                        *this.stash = Some(c);
+                        *this.state = State::Root;
+                        if let Ok(int) = this.buf.parse::<i64>() {
+                            this.buf.clear();
+                            return Poll::Ready(Some(Ok((*this.start_location, Token::Int(int)))));
                         }
-                        if let Ok(uint) = buf.parse::<u64>() {
-                            buf.clear();
-                            return Poll::Ready(Some(Ok((*start_location, Token::UInt(uint)))));
+                        if let Ok(uint) = this.buf.parse::<u64>() {
+                            this.buf.clear();
+                            return Poll::Ready(Some(Ok((
+                                *this.start_location,
+                                Token::UInt(uint),
+                            ))));
                         }
-                        let result = buf.parse::<f64>();
+                        let result = this.buf.parse::<f64>();
                         return Poll::Ready(Some(match result {
-                            Ok(float) => Ok((*start_location, Token::Float(float))),
+                            Ok(float) => Ok((*this.start_location, Token::Float(float))),
                             Err(_) => Err(Error::MalformedNumber {
-                                location: *start_location,
+                                location: *this.start_location,
                             }),
                         }));
                     }
@@ -363,18 +364,21 @@ impl<R: AsyncRead + Unpin> Stream for Lexer<R> {
 
                 State::InIdentifier => {
                     if c.is_alphanumeric() {
-                        buf.push(c);
+                        this.buf.push(c);
                     } else {
                         // save it for later
-                        *stash = Some(c);
-                        *state = State::Root;
-                        return if let Some(keyword) = check_keyword(buf.as_str()) {
-                            buf.clear();
-                            Poll::Ready(Some(Ok((*start_location, keyword))))
+                        *this.stash = Some(c);
+                        *this.state = State::Root;
+                        return if let Some(keyword) = check_keyword(this.buf.as_str()) {
+                            this.buf.clear();
+                            Poll::Ready(Some(Ok((*this.start_location, keyword))))
                         } else {
-                            let interned = interner.intern(buf.as_str()).unwrap();
-                            buf.clear();
-                            Poll::Ready(Some(Ok((*start_location, Token::Identifier(interned)))))
+                            let interned = this.interner.intern(this.buf.as_str()).unwrap();
+                            this.buf.clear();
+                            Poll::Ready(Some(Ok((
+                                *this.start_location,
+                                Token::Identifier(interned),
+                            ))))
                         };
                     }
                     cx.waker().wake_by_ref();
@@ -385,13 +389,16 @@ impl<R: AsyncRead + Unpin> Stream for Lexer<R> {
                     // Unquoted strings terminate on symbols or whitespace.
                     // TODO(lavignes): What if new symbols are added to the language?
                     if check_symbol(c).is_some() || c.is_whitespace() {
-                        *stash = Some(c);
-                        *state = State::Root;
-                        let interned = interner.intern(buf.as_str()).unwrap();
-                        buf.clear();
-                        return Poll::Ready(Some(Ok((*start_location, Token::String(interned)))));
+                        *this.stash = Some(c);
+                        *this.state = State::Root;
+                        let interned = this.interner.intern(this.buf.as_str()).unwrap();
+                        this.buf.clear();
+                        return Poll::Ready(Some(Ok((
+                            *this.start_location,
+                            Token::String(interned),
+                        ))));
                     } else {
-                        buf.push(c);
+                        this.buf.push(c);
                     }
                     cx.waker().wake_by_ref();
                     Poll::Pending
@@ -399,12 +406,15 @@ impl<R: AsyncRead + Unpin> Stream for Lexer<R> {
 
                 State::InQuotedString => {
                     if c == '\'' {
-                        *state = State::Root;
-                        let interned = interner.intern(buf.as_str()).unwrap();
-                        buf.clear();
-                        return Poll::Ready(Some(Ok((*start_location, Token::String(interned)))));
+                        *this.state = State::Root;
+                        let interned = this.interner.intern(this.buf.as_str()).unwrap();
+                        this.buf.clear();
+                        return Poll::Ready(Some(Ok((
+                            *this.start_location,
+                            Token::String(interned),
+                        ))));
                     } else {
-                        buf.push(c);
+                        this.buf.push(c);
                     }
                     cx.waker().wake_by_ref();
                     Poll::Pending
@@ -412,12 +422,15 @@ impl<R: AsyncRead + Unpin> Stream for Lexer<R> {
 
                 State::InDoubleQuotedString => {
                     if c == '"' {
-                        *state = State::Root;
-                        let interned = interner.intern(buf.as_str()).unwrap();
-                        buf.clear();
-                        return Poll::Ready(Some(Ok((*start_location, Token::String(interned)))));
+                        *this.state = State::Root;
+                        let interned = this.interner.intern(this.buf.as_str()).unwrap();
+                        this.buf.clear();
+                        return Poll::Ready(Some(Ok((
+                            *this.start_location,
+                            Token::String(interned),
+                        ))));
                     } else {
-                        buf.push(c);
+                        this.buf.push(c);
                     }
                     cx.waker().wake_by_ref();
                     Poll::Pending
@@ -426,29 +439,32 @@ impl<R: AsyncRead + Unpin> Stream for Lexer<R> {
             Poll::Ready(None) => {
                 // If we're at the end of input we might have something to flush in the buffer
                 //   or we're just in a comment
-                match *state {
+                match *this.state {
                     State::InIdentifier => {
-                        *state = State::Root;
-                        if let Some(keyword) = check_keyword(buf.as_str()) {
-                            buf.clear();
-                            Poll::Ready(Some(Ok((*start_location, keyword))))
+                        *this.state = State::Root;
+                        if let Some(keyword) = check_keyword(this.buf.as_str()) {
+                            this.buf.clear();
+                            Poll::Ready(Some(Ok((*this.start_location, keyword))))
                         } else {
-                            let interned = interner.intern(buf.as_str()).unwrap();
-                            buf.clear();
-                            Poll::Ready(Some(Ok((*start_location, Token::Identifier(interned)))))
+                            let interned = this.interner.intern(this.buf.as_str()).unwrap();
+                            this.buf.clear();
+                            Poll::Ready(Some(Ok((
+                                *this.start_location,
+                                Token::Identifier(interned),
+                            ))))
                         }
                     }
 
                     State::InUnquotedString => {
-                        *state = State::Root;
-                        let interned = interner.intern(buf.as_str()).unwrap();
-                        buf.clear();
-                        Poll::Ready(Some(Ok((*start_location, Token::String(interned)))))
+                        *this.state = State::Root;
+                        let interned = this.interner.intern(this.buf.as_str()).unwrap();
+                        this.buf.clear();
+                        Poll::Ready(Some(Ok((*this.start_location, Token::String(interned)))))
                     }
 
                     State::InComment => {
-                        *state = State::Root;
-                        Poll::Ready(Some(Ok((*start_location, Token::Comment))))
+                        *this.state = State::Root;
+                        Poll::Ready(Some(Ok((*this.start_location, Token::Comment))))
                     }
 
                     _ => Poll::Ready(None),
@@ -456,12 +472,12 @@ impl<R: AsyncRead + Unpin> Stream for Lexer<R> {
             }
 
             Poll::Ready(Some(Err(err))) => Poll::Ready(Some(Err(match err {
-                charstream::Error::Utf8Error(err) => Error::Utf8Error {
-                    location: *location,
+                asyncstr::Error::Utf8Error(err) => Error::Utf8Error {
+                    location: *this.location,
                     source: err,
                 },
-                charstream::Error::IoError(err) => Error::IoError {
-                    location: *location,
+                asyncstr::Error::IoError(err) => Error::IoError {
+                    location: *this.location,
                     source: err,
                 },
             }))),
