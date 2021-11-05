@@ -469,7 +469,8 @@ impl<R: AsyncRead + Unpin> Parser<R> {
         };
 
         match tok {
-            Token::String(_)
+            Token::Bool(_)
+            | Token::String(_)
             | Token::Identifier(_)
             | Token::Int(_)
             | Token::UInt(_)
@@ -599,6 +600,7 @@ impl<R: AsyncRead + Unpin> Parser<R> {
     async fn expect_primitive(&mut self) -> Result<(Location, Primitive), Error> {
         match self.next().await {
             Some(Ok((location, tok))) => match tok {
+                Token::Bool(b) => Ok((location, Primitive::Bool(b))),
                 Token::String(s) => Ok((location, Primitive::String(s))),
                 Token::Identifier(s) => Ok((location, Primitive::String(s))),
                 Token::Int(i) => Ok((location, Primitive::Int(i))),

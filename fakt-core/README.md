@@ -1,69 +1,64 @@
 ## Grammar
 
-This is the rough EBNF grammar for fakt files:
-
-* *Comments are excluded here but are like Python or Bash comments.* Any time a pound-sign or "hashtag" symbol `#` is encountered the rest of the
-  line is ignored.
+The grammar of fakt files is defined below, using `|` for alternatives, `[]` for optional, `{}` for repeated,
+and `()` for grouping.
+Tokens are either quoted literals (i.e. `"pkg"`) or defined as regular expressions enclosed in forward slashes (`//`).
 
 ```
-<pkg>                  ::= "pkg" <name> (<rule-or-property>)*
+Pkg                    = "pkg" Name { RuleOrProperty } ;
 
-<name>                 ::= <identifier> ("." <identifier>)*
+Name                   = Identifier { "." Identifier } ;
 
-<rule-or-property>     ::= <condition-lowest> "{" (<rule-or-property>)* "}"
-                         | <property> 
+RuleOrProperty         = ConditionLowest "{" { RuleOrProperty } "}"
+                       | Property
+                       ;
 
-<condition-lowest>     ::= <condition-low> "," <condition-low>
-                         | <condition-low> "or" <condition-low>
+ConditionLowest        = ConditionLow "," ConditionLow
+                       | ConditionLow "or" ConditionLow
+                       ;
 
-<condition-low>        ::= <condition-high> "xor" <condition-high>
+ConditionLow           = ConditionHigh "xor" ConditionHigh ;
 
-<condition-high>       ::= <condition-highest> "and"? <condition-lowest>
+ConditionHigh          = ConditionHighest [ "and" ] ConditionLowest ;
 
-<condition-highest>    ::= "(" <condition-lowest> ")"
-                         | "not" <condition-highest>
-                         | "!" <condition-highest>
+ConditionHighest       = "(" ConditionLowest ")"
+                       | "not" ConditionHighest
+                       | "!" ConditionHighest
+                       ;
 
-<fact>                 ::= <name> "[" <args> "]"
-                         | <name>
+Fact                   = Name [ "[" Args "]" ] ;
 
-<args>                 ::= <primitive> ("," <primitive>)*
+Args                   = Primitive { "," Primitive } ;
 
-<property>             ::= <name> ":" <value>
+Property               = Name ":" Value ;
 
-<value>                ::= <array>
-                         | <map>
-                         | <primitive>
+Value                  = Array | Map | Primitive ;
 
-<array>                ::= "[" <value> ("," <value>)* "]"
+Array                  = "[" Value { "," Value } "]" ;
 
-<map>                  ::= "{" <key-value-pair> ("," <key-value-pair>)* "}"
+Map                    = "{" KeyValuePair { "," KeyValuePair } "}" ;
 
-<key-value-pair>       ::= <string> ":" <value>
+KeyValuePair           = String ":" Value ;
 
-<string>               ::= <identifier>
-                         | <quoted-string>
-                         | <double-quoted-string>
-                         | <unquoted-string>
+Primitive              = "true" | "false" | String | INTEGER | UNSIGNED_INTEGER | FLOAT ;
 
-<primitive>            ::= <integer>
-                         | <unsigned-integer>
-                         | <float>
-                         | <string>
+String                 = IDENTIFIER | QUOTED_STRING | DOUBLE_QUOTED_STRING | UNQUOTED_STRING;
 
-<integer>              ::= /-?[\p{Number}i?]+/
+INTEGER                = /-?[\p{Number}i?]+/ ;
 
-<unsigned-integer>     ::= /[\p{Number}u?]+/
+UNSIGNED_INTEGER       = /[\p{Number}u?]+/ ;
 
-<float>                ::= <-- IEEE 754 64-bit float. (with optional trailing 'f') -->
+FLOAT                  = /-?\p{Number}*.[eE][+-]?\p{Number}+f?/
+                       | /-?\p{Number}+[eE][+-]?\p{Number}+f?/
+                       ;
 
-<identifier>           ::= /\p{Letter}[\p{Number}]*/
+IDENTIFIER             = /\p{Letter}[\p{Number}]*/ ;
 
-<quoted-string>        ::= /'[^']*'/
+QUOTED_STRING          = /'[^']*'/ ;
 
-<double-quoted-string> ::= /"[^"]*"/
+DOUBLE_QUOTED_STRING   = /"[^"]*"/ ;
 
-<unquoted-string>      ::= /[^\p{Letter}][^\s!:,.(){}[\]]+/
+UNQUOTED_STRING        = /[^\p{Letter}][^\s!:,.(){}[\]]+/ ;
 ```
 
 ## Examples

@@ -19,6 +19,7 @@ pub enum Primitive {
     Int(i64),
     UInt(u64),
     Float(f64),
+    Bool(bool),
 }
 
 #[derive(Debug)]

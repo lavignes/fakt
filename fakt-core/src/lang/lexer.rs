@@ -56,6 +56,7 @@ pub(crate) enum Token {
     Or,
     Xor,
     Not,
+    Bool(bool),
     Bang,
     Colon,
     Comma,
@@ -83,6 +84,7 @@ impl PartialEq for Token {
             (Self::Or, Self::Or) => true,
             (Self::Xor, Self::Xor) => true,
             (Self::Not, Self::Not) => true,
+            (Self::Bool(a), Self::Bool(b)) if a == b => true,
             (Self::Bang, Self::Bang) => true,
             (Self::Colon, Self::Colon) => true,
             (Self::Comma, Self::Comma) => true,
@@ -118,6 +120,8 @@ impl Display for Token {
                 Self::Or => "\"or\"",
                 Self::Xor => "\"xor\"",
                 Self::Not => "\"not\"",
+                Self::Bool(true) => "\"true\"",
+                Self::Bool(false) => "\"false\"",
                 Self::Bang => "\"!\"",
                 Self::Colon => "\":\"",
                 Self::Comma => "\",\"",
@@ -214,13 +218,20 @@ fn check_keyword(identifier: &str) -> Option<Token> {
         "or" => Some(Token::Or),
         "xor" => Some(Token::Xor),
         "not" => Some(Token::Not),
+        "true" => Some(Token::Bool(true)),
+        "false" => Some(Token::Bool(false)),
         _ => None,
     }
 }
 
 #[inline]
-fn is_numeric(ch: char) -> bool {
+fn is_numeric_start(ch: char) -> bool {
     ch.is_numeric() || (ch == '.') || (ch == '+') || (ch == '-')
+}
+
+#[inline]
+fn is_numeric(ch: char) -> bool {
+    is_numeric_start(ch) || (ch == 'e') || (ch == 'E')
 }
 
 impl<R: AsyncRead + Unpin> Stream for Lexer<R> {
@@ -342,7 +353,7 @@ impl<R: AsyncRead + Unpin> Stream for Lexer<R> {
                     } else if c == '#' {
                         *this.start_location = *this.location;
                         *this.state = State::InComment;
-                    } else if is_numeric(c) {
+                    } else if is_numeric_start(c) {
                         this.buf.push(c);
                         *this.start_location = *this.location;
                         *this.state = State::InNumeric;
@@ -575,13 +586,15 @@ mod tests {
     #[test]
     fn keywords() {
         let mut cx = cx();
-        let mut lexer = Lexer::new(Cursor::new("pkg and or xor not"));
+        let mut lexer = Lexer::new(Cursor::new("pkg and or xor not true false"));
         assert_token(&mut cx, &mut lexer, (1, 1), Token::Pkg);
         assert_token(&mut cx, &mut lexer, (1, 5), Token::And);
         assert_token(&mut cx, &mut lexer, (1, 9), Token::Or);
         assert_token(&mut cx, &mut lexer, (1, 12), Token::Xor);
-        assert_pending(&mut cx, &mut lexer);
         assert_token(&mut cx, &mut lexer, (1, 16), Token::Not);
+        assert_token(&mut cx, &mut lexer, (1, 20), Token::Bool(true));
+        assert_pending(&mut cx, &mut lexer);
+        assert_token(&mut cx, &mut lexer, (1, 25), Token::Bool(false));
         assert_none(&mut cx, &mut lexer);
     }
 
