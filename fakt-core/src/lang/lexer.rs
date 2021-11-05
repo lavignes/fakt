@@ -283,7 +283,32 @@ impl<R: AsyncRead + Unpin> Stream for Lexer<R> {
                     Poll::Ready(Some(Ok((*this.start_location, Token::Comment))))
                 }
 
-                _ => Poll::Ready(None),
+                State::InNumeric => {
+                    *this.state = State::Root;
+                    if let Ok(int) = this.buf.parse::<i64>() {
+                        this.buf.clear();
+                        Poll::Ready(Some(Ok((*this.start_location, Token::Int(int)))))
+                    } else if let Ok(uint) = this.buf.parse::<u64>() {
+                        this.buf.clear();
+                        Poll::Ready(Some(Ok((*this.start_location, Token::UInt(uint)))))
+                    } else {
+                        let result = this.buf.parse::<f64>();
+                        this.buf.clear();
+                        Poll::Ready(Some(match result {
+                            Ok(float) => Ok((*this.start_location, Token::Float(float))),
+                            Err(_) => Err(Error::MalformedNumber {
+                                location: *this.start_location,
+                            }),
+                        }))
+                    }
+                }
+
+                _ => {
+                    // youd hope that the buf is empty here otherwise we'd be in the middle of some
+                    // token most likely
+                    debug_assert!(this.buf.is_empty());
+                    Poll::Ready(None)
+                }
             };
         }
 
@@ -390,6 +415,7 @@ impl<R: AsyncRead + Unpin> Stream for Lexer<R> {
                             ))));
                         }
                         let result = this.buf.parse::<f64>();
+                        this.buf.clear();
                         return Poll::Ready(Some(match result {
                             Ok(float) => Ok((*this.start_location, Token::Float(float))),
                             Err(_) => Err(Error::MalformedNumber {
@@ -498,6 +524,27 @@ mod tests {
         assert!(matches!(Pin::new(lexer).poll_next(cx), Poll::Pending));
     }
 
+    fn assert_malformed_number<R: AsyncRead + Unpin>(
+        cx: &mut Context<'_>,
+        lexer: &mut Lexer<R>,
+        location: (usize, usize),
+    ) {
+        let result = Pin::new(lexer).poll_next(cx);
+        assert!(matches!(
+            result,
+            Poll::Ready(Some(Err(Error::MalformedNumber { .. })))
+        ));
+        if let Poll::Ready(Some(Err(Error::MalformedNumber { location: loc }))) = result {
+            assert_eq!(
+                Location {
+                    line: location.0,
+                    column: location.1
+                },
+                loc
+            );
+        }
+    }
+
     fn assert_token<R: AsyncRead + Unpin>(
         cx: &mut Context<'_>,
         lexer: &mut Lexer<R>,
@@ -593,6 +640,24 @@ mod tests {
         let mut cx = cx();
         let mut lexer = Lexer::new(Cursor::new("1234f"));
         assert_token(&mut cx, &mut lexer, (1, 1), Token::Float(1234.0));
+        assert_none(&mut cx, &mut lexer);
+    }
+
+    #[test]
+    fn ambiguous_integer() {
+        let mut cx = cx();
+        let mut lexer = Lexer::new(Cursor::new("1234"));
+        assert_pending(&mut cx, &mut lexer);
+        assert_token(&mut cx, &mut lexer, (1, 1), Token::Int(1234));
+        assert_none(&mut cx, &mut lexer);
+    }
+
+    #[test]
+    fn malformed_number() {
+        let mut cx = cx();
+        let mut lexer = Lexer::new(Cursor::new("-1234.."));
+        assert_pending(&mut cx, &mut lexer);
+        assert_malformed_number(&mut cx, &mut lexer, (1, 1));
         assert_none(&mut cx, &mut lexer);
     }
 
