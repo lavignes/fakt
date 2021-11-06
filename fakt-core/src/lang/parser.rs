@@ -116,28 +116,28 @@ impl<R: AsyncRead + Unpin> Parser<R> {
             }
         };
         match tok {
-            Token::Dollar => {
-                if let Err(err) = self.expect_simple_token(Token::Dollar).await {
-                    return Some(Err(err));
-                }
-                match self.expect_identifier().await {
-                    Ok((_, Token::Identifier(identifier))) => {
-                        if let Err(err) = self.expect_simple_token(Token::Colon).await {
-                            return Some(Err(err));
-                        }
-                        match self.condition_highest(None).await {
-                            Ok(condition) => Some(Ok(Item::RuleAlias(RuleAlias {
-                                identifier,
-                                condition,
-                            }))),
-                            Err(err) => Some(Err(err)),
-                        }
-                    }
-                    Ok((_, _)) => unreachable!(),
-                    Err(err) => Some(Err(err)),
+            Token::Dollar => Some(self.rule_alias().await.map(Item::RuleAlias)),
+            _ => Some(self.rule_prop_opt().await?.map(Item::RuleOrProperty)),
+        }
+    }
+
+    async fn rule_alias(&mut self) -> Result<RuleAlias, Error> {
+        self.expect_simple_token(Token::Dollar).await?;
+        match self.expect_identifier().await? {
+            (_, Token::Identifier(identifier)) => {
+                self.expect_simple_token(Token::Colon).await?;
+                match self.condition_highest(None).await {
+                    Ok(condition) => Ok(RuleAlias {
+                        identifier,
+                        condition,
+                    }),
+                    Err(err) => Err(err),
                 }
             }
-            _ => Some(self.rule_prop_opt().await?.map(Item::RuleOrProperty)),
+            (_, tok) => Err(Error::SyntaxError {
+                location: self.lexer.location,
+                message: format!("unexpected {}, expected a rule alias identifier", tok),
+            }),
         }
     }
 
@@ -838,7 +838,6 @@ mod tests {
                 ));
             }
         }
-
 
         let item = &children[1];
         assert!(matches!(item, Item::RuleOrProperty(_)));
