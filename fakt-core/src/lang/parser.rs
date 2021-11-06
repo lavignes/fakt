@@ -122,6 +122,9 @@ impl<R: AsyncRead + Unpin> Parser<R> {
                 }
                 match self.expect_identifier().await {
                     Ok((_, Token::Identifier(identifier))) => {
+                        if let Err(err) = self.expect_simple_token(Token::Colon).await {
+                            return Some(Err(err));
+                        }
                         match self.condition_highest(None).await {
                             Ok(condition) => Some(Ok(Item::RuleAlias(RuleAlias {
                                 identifier,
