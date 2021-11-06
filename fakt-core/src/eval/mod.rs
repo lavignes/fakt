@@ -1,4 +1,4 @@
-#[cfg(target_feature = "eval_naive")]
+#[cfg(feature = "eval_naive")]
 mod naive;
 
 #[derive(thiserror::Error, Debug)]

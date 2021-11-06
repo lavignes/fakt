@@ -4,12 +4,14 @@ use futures::{AsyncRead, StreamExt};
 use fxhash::FxHashMap;
 
 use crate::{
-    collections::{Interned, Interner},
+    collections::{StrInterner, StrRef},
     lang::{
         ast::{Condition, Name, Package, Primitive, Property, PropertyValue, Rule, RuleOrProperty},
         lexer::{self, Lexer, Location, Token},
     },
 };
+
+use super::ast::{Item, RuleAlias};
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
@@ -18,11 +20,13 @@ pub enum Error {
         location: Location,
         source: io::Error,
     },
+
     #[error("{} {}", .location, .source)]
     Utf8Error {
         location: Location,
         source: str::Utf8Error,
     },
+
     #[error("{} {}", .location, .message)]
     SyntaxError { location: Location, message: String },
 }
@@ -55,11 +59,11 @@ pub struct Parser<R> {
 impl<R: AsyncRead + Unpin> Parser<R> {
     #[inline]
     pub fn new(reader: R) -> Self {
-        Self::with_interner(reader, Rc::new(Interner::new()))
+        Self::with_interner(reader, Rc::new(StrInterner::new()))
     }
 
     #[inline]
-    pub fn with_interner(reader: R, interner: Rc<Interner<str>>) -> Self {
+    pub fn with_interner(reader: R, interner: Rc<StrInterner>) -> Self {
         Self {
             lexer: Lexer::with_interner(reader, interner),
             stash: None,
@@ -68,7 +72,7 @@ impl<R: AsyncRead + Unpin> Parser<R> {
 
     pub async fn parse(&mut self) -> Result<Package, Error> {
         let name = self.package_name().await?;
-        let children = match self.rule_props_opt().await {
+        let children = match self.items_opt().await {
             Some(Err(err)) => {
                 return Err(err);
             }
@@ -82,6 +86,56 @@ impl<R: AsyncRead + Unpin> Parser<R> {
         self.expect_simple_token(Token::Pkg).await?;
         let (_, name) = self.expect_name().await?;
         Ok(name)
+    }
+
+    #[async_recursion::async_recursion(?Send)]
+    async fn items_opt(&mut self) -> Option<Result<Vec<Item>, Error>> {
+        let mut items = Vec::new();
+        while let Some(result) = self.item_opt().await {
+            match result {
+                Ok(item) => items.push(item),
+                Err(err) => {
+                    return Some(Err(err));
+                }
+            }
+        }
+        // There is actually no allocation for an empty vec
+        //   but we signal intent here.
+        if items.is_empty() {
+            None
+        } else {
+            Some(Ok(items))
+        }
+    }
+
+    async fn item_opt(&mut self) -> Option<Result<Item, Error>> {
+        let (_, tok) = match self.peek().await? {
+            Ok(ok) => ok,
+            Err(err) => {
+                return Some(Err(err));
+            }
+        };
+        match tok {
+            Token::Dollar => {
+                if let Err(err) = self.expect_simple_token(Token::Dollar).await {
+                    return Some(Err(err));
+                }
+                match self.expect_identifier().await {
+                    Ok((_, Token::Identifier(identifier))) => {
+                        match self.condition_highest(None).await {
+                            Ok(condition) => Some(Ok(Item::RuleAlias(RuleAlias {
+                                identifier,
+                                condition,
+                            }))),
+                            Err(err) => Some(Err(err)),
+                        }
+                    }
+                    Ok((_, _)) => unreachable!(),
+                    Err(err) => Some(Err(err)),
+                }
+            }
+            _ => Some(self.rule_prop_opt().await?.map(Item::RuleOrProperty)),
+        }
     }
 
     #[async_recursion::async_recursion(?Send)]
@@ -521,9 +575,7 @@ impl<R: AsyncRead + Unpin> Parser<R> {
         Ok((location, array))
     }
 
-    async fn expect_map(
-        &mut self,
-    ) -> Result<(Location, FxHashMap<Interned<str>, PropertyValue>), Error> {
+    async fn expect_map(&mut self) -> Result<(Location, FxHashMap<StrRef, PropertyValue>), Error> {
         let (location, _) = self.expect_simple_token(Token::BraceOpen).await?;
 
         let mut map = FxHashMap::default();
@@ -579,7 +631,7 @@ impl<R: AsyncRead + Unpin> Parser<R> {
         }
     }
 
-    async fn expect_string(&mut self) -> Result<(Location, Interned<str>), Error> {
+    async fn expect_string(&mut self) -> Result<(Location, StrRef), Error> {
         match self.next().await {
             Some(Ok((location, tok))) => match tok {
                 Token::String(s) => Ok((location, s)),
@@ -655,7 +707,6 @@ mod tests {
     use futures::{executor, io::Cursor};
 
     use super::*;
-    use crate::{collections::Interned, lang::ast::PropertyValue};
 
     fn assert_syntax_err(result: Result<Package, Error>, location: (usize, usize), msg: &str) {
         assert!(matches!(result, Err(Error::SyntaxError { .. })));
@@ -670,11 +721,11 @@ mod tests {
         }
     }
 
-    fn assert_str(interner: &Interner<str>, s: &str, interned: Interned<str>) {
+    fn assert_str(interner: &StrInterner, s: &str, interned: StrRef) {
         assert_eq!(Some(true), interner.eq(s, interned));
     }
 
-    fn assert_name(interner: &Interner<str>, s: &str, name: &Name) {
+    fn assert_name(interner: &StrInterner, s: &str, name: &Name) {
         for (expected, actual) in s.split('.').zip(name.parts.iter()) {
             assert_str(interner, expected, *actual);
         }
@@ -717,14 +768,17 @@ mod tests {
         let pkg = executor::block_on(p.parse()).unwrap();
         assert_name(&p.lexer.interner, "hello.world", &pkg.name);
 
-        let rule = &pkg.children.unwrap()[0];
-        assert!(matches!(rule, RuleOrProperty::Rule(_)));
-        if let RuleOrProperty::Rule(rule) = rule {
-            assert!(matches!(rule.condition, Condition::Fact(_, None)));
-            if let Condition::Fact(ident, _) = &rule.condition {
-                assert_name(&p.lexer.interner, "simple", ident);
+        let item = &pkg.children.unwrap()[0];
+        assert!(matches!(item, Item::RuleOrProperty(_)));
+        if let Item::RuleOrProperty(rule) = item {
+            assert!(matches!(rule, RuleOrProperty::Rule(_)));
+            if let RuleOrProperty::Rule(rule) = rule {
+                assert!(matches!(rule.condition, Condition::Fact(_, None)));
+                if let Condition::Fact(ident, _) = &rule.condition {
+                    assert_name(&p.lexer.interner, "simple", ident);
+                }
+                assert!(matches!(rule.children, None));
             }
-            assert!(matches!(rule.children, None));
         }
     }
 
@@ -740,14 +794,17 @@ mod tests {
         let pkg = executor::block_on(p.parse()).unwrap();
         assert_name(&p.lexer.interner, "hello.world", &pkg.name);
 
-        let prop = &pkg.children.unwrap()[0];
-        assert!(matches!(prop, RuleOrProperty::Property(_)));
-        if let RuleOrProperty::Property(prop) = prop {
-            assert_name(&p.lexer.interner, "prop.name", &prop.name);
-            assert!(matches!(
-                prop.value,
-                PropertyValue::Primitive(Primitive::Int(12345))
-            ));
+        let item = &pkg.children.unwrap()[0];
+        assert!(matches!(item, Item::RuleOrProperty(_)));
+        if let Item::RuleOrProperty(prop) = item {
+            assert!(matches!(prop, RuleOrProperty::Property(_)));
+            if let RuleOrProperty::Property(prop) = prop {
+                assert_name(&p.lexer.interner, "prop.name", &prop.name);
+                assert!(matches!(
+                    prop.value,
+                    PropertyValue::Primitive(Primitive::Int(12345))
+                ));
+            }
         }
     }
 
@@ -765,26 +822,34 @@ mod tests {
         assert_name(&p.lexer.interner, "hello.world", &pkg.name);
 
         let children = &pkg.children.unwrap();
-        let prop = &children[0];
-        assert!(matches!(prop, RuleOrProperty::Property(_)));
-        if let RuleOrProperty::Property(prop) = prop {
-            assert_name(&p.lexer.interner, "prop.name1", &prop.name);
-            assert!(matches!(
-                prop.value,
-                PropertyValue::Primitive(Primitive::Int(12345))
-            ));
+
+        let item = &children[0];
+        assert!(matches!(item, Item::RuleOrProperty(_)));
+        if let Item::RuleOrProperty(prop) = item {
+            assert!(matches!(prop, RuleOrProperty::Property(_)));
+            if let RuleOrProperty::Property(prop) = prop {
+                assert_name(&p.lexer.interner, "prop.name1", &prop.name);
+                assert!(matches!(
+                    prop.value,
+                    PropertyValue::Primitive(Primitive::Int(12345))
+                ));
+            }
         }
 
-        let prop = &children[1];
-        assert!(matches!(prop, RuleOrProperty::Property(_)));
-        if let RuleOrProperty::Property(prop) = prop {
-            assert_name(&p.lexer.interner, "prop.name2", &prop.name);
-            assert!(matches!(
-                prop.value,
-                PropertyValue::Primitive(Primitive::String(_))
-            ));
-            if let PropertyValue::Primitive(Primitive::String(value)) = prop.value {
-                assert_str(&p.lexer.interner, "hello!", value);
+
+        let item = &children[1];
+        assert!(matches!(item, Item::RuleOrProperty(_)));
+        if let Item::RuleOrProperty(prop) = item {
+            assert!(matches!(prop, RuleOrProperty::Property(_)));
+            if let RuleOrProperty::Property(prop) = prop {
+                assert_name(&p.lexer.interner, "prop.name2", &prop.name);
+                assert!(matches!(
+                    prop.value,
+                    PropertyValue::Primitive(Primitive::String(_))
+                ));
+                if let PropertyValue::Primitive(Primitive::String(value)) = prop.value {
+                    assert_str(&p.lexer.interner, "hello!", value);
+                }
             }
         }
     }

@@ -1,145 +1,130 @@
-use std::{
-    hash::Hash,
-    marker::PhantomData,
-    ops::DerefMut,
-    ptr::slice_from_raw_parts,
-    rc::Rc,
-    str,
-    sync::{Arc, RwLock},
-};
+use std::{borrow::Borrow, hash::Hash, marker::PhantomData, mem, ops::{Add, DerefMut}, ptr, rc::Rc, str, sync::{Arc, RwLock}};
 
-use fxhash::FxHashMap;
+use fxhash::FxHashSet;
 
-#[derive(Debug, Eq, PartialEq, Hash)]
-pub struct Interned<T: ?Sized> {
-    slice_id: usize,
-    marker: PhantomData<T>,
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+pub struct BytesRef(RiskySlice<'static>);
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+struct RiskySlice<'a> {
+    data: *const u8,
+    len: usize,
+    marker: PhantomData<&'a ()>,
 }
 
-impl<T: ?Sized> Copy for Interned<T> {}
-
-impl<T: ?Sized> Clone for Interned<T> {
-    fn clone(&self) -> Interned<T> {
-        Interned {
-            slice_id: self.slice_id,
-            marker: PhantomData,
-        }
-    }
-}
-
-pub trait Internable {
-    fn to_bytes(&self) -> &[u8];
-    fn from_bytes(bytes: &[u8]) -> &Self;
-}
-
-impl Internable for str {
-    #[inline]
-    fn to_bytes(&self) -> &[u8] {
-        self.as_bytes()
-    }
-
-    #[inline]
-    fn from_bytes(bytes: &[u8]) -> &str {
-        unsafe { str::from_utf8_unchecked(bytes) }
+impl<'a> Borrow<[u8]> for RiskySlice<'a> {
+    fn borrow(&self) -> &[u8] {
+        unsafe { &*ptr::slice_from_raw_parts(self.data, self.len) }
     }
 }
 
 #[derive(Default, Debug)]
-pub struct Interner<T>
-where
-    T: Internable + Eq + Hash + ?Sized + 'static,
-{
-    map: FxHashMap<&'static T, usize>,
-    slices: Vec<&'static [u8]>,
+pub struct BytesInterner {
+    map: FxHashSet<RiskySlice<'static>>,
     buffers: Vec<Vec<u8>>,
 }
 
-impl<T> Interner<T>
-where
-    T: Internable + Eq + Hash + ?Sized,
-{
+impl BytesInterner {
     #[inline]
     pub fn new() -> Self {
         Self {
-            map: FxHashMap::default(),
-            slices: Vec::new(),
+            map: FxHashSet::default(),
             buffers: vec![Vec::with_capacity(32)],
         }
     }
 
-    pub fn intern(&mut self, value: &T) -> Interned<T> {
-        if let Some(&id) = self.map.get(value) {
-            return Interned {
-                slice_id: id,
-                marker: PhantomData,
-            };
+    pub fn intern<T: AsRef<[u8]>>(&mut self, bytes: T) -> BytesRef {
+        let bytes = bytes.as_ref();
+        if let Some(&slice) = self.map.get(bytes) {
+            return BytesRef(unsafe { mem::transmute::<_, RiskySlice<'static>>(slice) });
         }
-        let (slice, interned) = unsafe { self.buffer(value) };
-        let id = self.slices.len();
-        self.map.insert(interned, id);
-        self.slices.push(slice);
-        Interned {
-            slice_id: id,
-            marker: PhantomData,
-        }
+        let slice = self.buffer(bytes);
+        self.map.insert(slice);
+        BytesRef(slice)
     }
 
     #[inline]
-    pub fn get(&self, interned: Interned<T>) -> Option<&T> {
-        self.slices
-            .get(interned.slice_id)
-            .map(|&slice| T::from_bytes(slice))
+    pub fn get(&self, bytes: BytesRef) -> Option<&[u8]> {
+        self.map.get(&bytes.0).map(|slice| slice.borrow())
     }
 
     #[inline]
-    pub fn eq(&self, expected: &T, interned: Interned<T>) -> Option<bool> {
-        self.get(interned).map(|s| expected == s)
+    pub fn eq<T: AsRef<[u8]>>(&self, expected: T, interned: BytesRef) -> Option<bool> {
+        self.get(interned).map(|s| expected.as_ref() == s)
     }
 
-    // Safety: We preserve pointer validity by chaining buffers together
-    //   rather than re-allocating them
-    unsafe fn buffer(&mut self, value: &T) -> (&'static [u8], &'static T) {
-        let bytes = value.to_bytes();
+    fn buffer(&mut self, slice: &[u8]) -> RiskySlice<'static> {
         let buffer = self.buffers.last().unwrap();
         let capacity = buffer.capacity();
-        if capacity < buffer.len() + bytes.len() {
-            let new_capacity = (capacity.max(bytes.len()) + 1).next_power_of_two();
+        if capacity < buffer.len() + slice.len() {
+            let new_capacity = (capacity.max(slice.len()) + 1).next_power_of_two();
             self.buffers.push(Vec::with_capacity(new_capacity));
         }
 
         let buffer = self.buffers.last_mut().unwrap();
         let start = buffer.len();
-        buffer.extend_from_slice(bytes);
-
-        // Here's the sketchy bit. We coerce the newly copied bytes into a slice
-        let slice = &*slice_from_raw_parts(buffer.as_ptr().add(start), bytes.len());
-        (slice, T::from_bytes(slice))
+        buffer.extend_from_slice(slice);
+        // Safety: We preserve pointer validity by chaining buffers together
+        //   rather than re-allocating them
+        unsafe {
+            RiskySlice {
+                data: buffer.as_ptr().add(start),
+                len: slice.len(),
+                marker: PhantomData,
+            }
+        }
     }
 }
 
-pub trait InternerRcWriteExt<T>
-where
-    T: Internable + Eq + Hash + ?Sized + 'static,
-{
-    fn intern(&mut self, value: &T) -> Option<Interned<T>>;
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+pub struct StrRef(BytesRef);
+
+#[derive(Default, Debug)]
+pub struct StrInterner {
+    inner: BytesInterner,
 }
 
-impl<T> InternerRcWriteExt<T> for Rc<Interner<T>>
-where
-    T: Internable + Eq + Hash + ?Sized + 'static,
-{
+impl StrInterner {
     #[inline]
-    fn intern(&mut self, value: &T) -> Option<Interned<T>> {
+    pub fn new() -> Self {
+        Self {
+            inner: BytesInterner::new(),
+        }
+    }
+
+    #[inline]
+    pub fn intern<T: AsRef<str>>(&mut self, string: T) -> StrRef {
+        let string = string.as_ref();
+        StrRef(self.inner.intern(string.as_bytes()))
+    }
+
+    #[inline]
+    pub fn get(&self, string: StrRef) -> Option<&str> {
+        self.inner
+            .get(string.0)
+            .map(|b| unsafe { str::from_utf8_unchecked(b) })
+    }
+
+    #[inline]
+    pub fn eq<T: AsRef<str>>(&self, expected: T, interned: StrRef) -> Option<bool> {
+        self.inner.eq(expected.as_ref().as_bytes(), interned.0)
+    }
+}
+
+pub trait StrInternerRcWriteExt {
+    fn intern<T: AsRef<str>>(&mut self, value: T) -> Option<StrRef>;
+}
+
+impl StrInternerRcWriteExt for Rc<StrInterner> {
+    #[inline]
+    fn intern<T: AsRef<str>>(&mut self, value: T) -> Option<StrRef> {
         Rc::get_mut(self).map(|s| s.intern(value))
     }
 }
 
-impl<T> InternerRcWriteExt<T> for Arc<RwLock<Interner<T>>>
-where
-    T: Internable + Eq + Hash + ?Sized + 'static,
-{
+impl StrInternerRcWriteExt for Arc<RwLock<StrInterner>> {
     #[inline]
-    fn intern(&mut self, value: &T) -> Option<Interned<T>> {
+    fn intern<T: AsRef<str>>(&mut self, value: T) -> Option<StrRef> {
         Arc::get_mut(self).map(|s| s.write().unwrap().deref_mut().intern(value))
     }
 }
@@ -149,8 +134,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn basic() {
-        let mut int = Interner::new();
+    fn sanity() {
+        let mut int = StrInterner::new();
         let hello = int.intern("hello");
 
         assert_eq!("hello", int.get(hello).unwrap());

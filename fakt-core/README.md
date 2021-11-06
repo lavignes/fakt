@@ -5,9 +5,13 @@ and `()` for grouping.
 Tokens are either quoted literals (i.e. `"pkg"`) or defined as regular expressions enclosed in forward slashes (`//`).
 
 ```
-Pkg                    = "pkg" Name { RuleOrProperty } ;
+Pkg                    = "pkg" Name { Item } ;
 
 Name                   = Identifier { "." Identifier } ;
+
+Item                   = RuleOrProperty
+                       | RuleAlias
+                       ;
 
 RuleOrProperty         = ConditionLowest "{" { RuleOrProperty } "}"
                        | Property
@@ -24,7 +28,11 @@ ConditionHigh          = ConditionHighest [ "and" ] ConditionLowest ;
 ConditionHighest       = "(" ConditionLowest ")"
                        | "not" ConditionHighest
                        | "!" ConditionHighest
+                       | "$" Identifier
+                       | Fact
                        ;
+
+RuleAlias              = "$" Identifier ConditionHighest ;
 
 Fact                   = Name [ "[" Args "]" ] ;
 
@@ -69,12 +77,14 @@ pkg test.package
 
 weekend: false
 
-saturday, sunday {
+$days: (saturday, sunday)
+
+$days {
     weekend: true
 }
 ```
 
 ```
 # It can be on one line!
-pkg test.package weekend:false saturday,sunday{weekend:true}
+pkg test.package weekend:false $days:saturday,sunday $days{weekend:true}
 ```

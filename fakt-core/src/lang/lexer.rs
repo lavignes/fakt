@@ -12,7 +12,7 @@ use futures::{
 };
 
 use crate::{
-    collections::{Interned, Interner, InternerRcWriteExt},
+    collections::{StrInterner, StrRef, StrInternerRcWriteExt},
     lang::asyncstr::{self, AsyncStrReader},
 };
 
@@ -60,6 +60,7 @@ pub(crate) enum Token {
     Bang,
     Colon,
     Comma,
+    Dollar,
     Dot,
     ParenOpen,
     ParenClose,
@@ -70,8 +71,8 @@ pub(crate) enum Token {
     Int(i64),
     UInt(u64),
     Float(f64),
-    String(Interned<str>),
-    Identifier(Interned<str>),
+    String(StrRef),
+    Identifier(StrRef),
 }
 
 impl PartialEq for Token {
@@ -88,6 +89,7 @@ impl PartialEq for Token {
             (Self::Bang, Self::Bang) => true,
             (Self::Colon, Self::Colon) => true,
             (Self::Comma, Self::Comma) => true,
+            (Self::Dollar, Self::Dollar) => true,
             (Self::Dot, Self::Dot) => true,
             (Self::ParenOpen, Self::ParenOpen) => true,
             (Self::ParenClose, Self::ParenClose) => true,
@@ -125,6 +127,7 @@ impl Display for Token {
                 Self::Bang => "\"!\"",
                 Self::Colon => "\":\"",
                 Self::Comma => "\",\"",
+                Self::Dollar => "\"$\"",
                 Self::Dot => "\".\"",
                 Self::ParenOpen => "\"(\"",
                 Self::ParenClose => "\")\"",
@@ -160,7 +163,7 @@ pin_project_lite::pin_project! {
     pub(crate) struct Lexer<R> {
         #[pin]
         reader: AsyncStrReader<R>,
-        pub(crate) interner: Rc<Interner<str>>,
+        pub(crate) interner: Rc<StrInterner>,
         start_location: Location,
         pub(crate) location: Location,
         buf: String,
@@ -172,11 +175,11 @@ impl<'a, R: AsyncRead + Unpin> Lexer<R> {
     #[cfg(test)]
     #[inline]
     pub(crate) fn new(reader: R) -> Self {
-        Self::with_interner(reader, Rc::new(Interner::new()))
+        Self::with_interner(reader, Rc::new(StrInterner::new()))
     }
 
     #[inline]
-    pub(crate) fn with_interner(reader: R, interner: Rc<Interner<str>>) -> Self {
+    pub(crate) fn with_interner(reader: R, interner: Rc<StrInterner>) -> Self {
         Self {
             reader: AsyncStrReader::new(reader),
             interner,
@@ -199,6 +202,7 @@ fn check_symbol(c: char) -> Option<Token> {
         '!' => Some(Token::Bang),
         ':' => Some(Token::Colon),
         ',' => Some(Token::Comma),
+        '$' => Some(Token::Dollar),
         '.' => Some(Token::Dot),
         '(' => Some(Token::ParenOpen),
         ')' => Some(Token::ParenClose),
@@ -234,6 +238,8 @@ fn is_numeric(ch: char) -> bool {
     is_numeric_start(ch) || (ch == 'e') || (ch == 'E')
 }
 
+// TODO(lavignes): Migrating to a buffered reader model like `AsyncStrReader`
+//   that emits slices of tokens would likely be way faster.
 impl<R: AsyncRead + Unpin> Stream for Lexer<R> {
     type Item = Result<(Location, Token), Error>;
 
@@ -601,17 +607,18 @@ mod tests {
     #[test]
     fn symbols() {
         let mut cx = cx();
-        let mut lexer = Lexer::new(Cursor::new("! : , . ( ) { } [ ]"));
+        let mut lexer = Lexer::new(Cursor::new("! : , $ . ( ) { } [ ]"));
         assert_token(&mut cx, &mut lexer, (1, 1), Token::Bang);
         assert_token(&mut cx, &mut lexer, (1, 3), Token::Colon);
         assert_token(&mut cx, &mut lexer, (1, 5), Token::Comma);
         assert_token(&mut cx, &mut lexer, (1, 7), Token::Dot);
-        assert_token(&mut cx, &mut lexer, (1, 9), Token::ParenOpen);
-        assert_token(&mut cx, &mut lexer, (1, 11), Token::ParenClose);
-        assert_token(&mut cx, &mut lexer, (1, 13), Token::BraceOpen);
-        assert_token(&mut cx, &mut lexer, (1, 15), Token::BraceClose);
-        assert_token(&mut cx, &mut lexer, (1, 17), Token::BracketOpen);
-        assert_token(&mut cx, &mut lexer, (1, 19), Token::BracketClose);
+        assert_token(&mut cx, &mut lexer, (1, 9), Token::Dot);
+        assert_token(&mut cx, &mut lexer, (1, 11), Token::ParenOpen);
+        assert_token(&mut cx, &mut lexer, (1, 13), Token::ParenClose);
+        assert_token(&mut cx, &mut lexer, (1, 15), Token::BraceOpen);
+        assert_token(&mut cx, &mut lexer, (1, 17), Token::BraceClose);
+        assert_token(&mut cx, &mut lexer, (1, 19), Token::BracketOpen);
+        assert_token(&mut cx, &mut lexer, (1, 21), Token::BracketClose);
         assert_none(&mut cx, &mut lexer);
     }
 

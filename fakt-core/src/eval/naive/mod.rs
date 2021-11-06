@@ -1,7 +1,7 @@
 use fxhash::FxHashMap;
 
 use crate::{
-    collections::Interned,
+    collections::StrRef,
     eval::{Error, Evaluate},
 };
 
@@ -12,7 +12,7 @@ use crate::{
 struct Props {}
 
 pub(crate) struct NaiveEvaluator {
-    _logic: FxHashMap<Interned<str>, Props>,
+    _logic: FxHashMap<StrRef, Props>,
 }
 
 impl<T> Evaluate<T> for NaiveEvaluator {
